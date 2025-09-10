@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:record/record.dart';
 import 'package:just_audio/just_audio.dart';
@@ -82,6 +84,16 @@ class _VoiceRecorderScreenState extends State<VoiceRecorderScreen> {
     }
   }
 
+
+// Add this function inside _VoiceRecorderScreenState
+  Future<void> _convertToBase64() async {
+    if (_filePath == null || !(await File(_filePath!).exists())) return;
+    final fileBytes = await File(_filePath!).readAsBytes();
+    final base64String = base64Encode(fileBytes);
+    debugPrint('Base64 String: $base64String');
+    // You can use the base64String as needed
+  }
+
   @override
   void dispose() {
     _audioRecorder.dispose();
@@ -108,6 +120,10 @@ class _VoiceRecorderScreenState extends State<VoiceRecorderScreen> {
             ElevatedButton(
               onPressed: (!_isRecording && _filePath != null && !_isPlaying) ? _playRecording : null,
               child: const Text('Play Recording'),
+            ),
+            ElevatedButton(
+              onPressed: (!_isRecording && _filePath != null) ? _convertToBase64 : null,
+              child: const Text('Convert to Base64'),
             ),
           ],
         ),
