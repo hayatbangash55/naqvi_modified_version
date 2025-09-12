@@ -7,8 +7,332 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:audio_waveforms/audio_waveforms.dart';
+import 'package:record/record.dart';
 import 'dart:io';
 import 'dart:ui' as ui;
+import 'dart:math' as math;
+
+// Custom Waveform Widget
+class CustomWaveformWidget extends StatefulWidget {
+  final RecorderController? recorderController;
+  final PlayerController? playerController;
+  final bool isRecording;
+  final bool isPlaying;
+  final int currentDuration;
+  final double width;
+  final double height;
+
+  const CustomWaveformWidget({
+    super.key,
+    this.recorderController,
+    this.playerController,
+    required this.isRecording,
+    required this.isPlaying,
+    required this.currentDuration,
+    required this.width,
+    required this.height,
+  });
+
+  @override
+  State<CustomWaveformWidget> createState() => _CustomWaveformWidgetState();
+}
+
+class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
+    with TickerProviderStateMixin {
+  late AnimationController _animationController;
+  final List<double> _amplitudes = [];
+  Timer? _amplitudeTimer;
+  double _currentAmplitude = 0.0;
+  final AudioRecorder _amplitudeRecord = AudioRecorder();
+  Timer? _amplitudeMonitorTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _animationController = AnimationController(
+      duration: const Duration(milliseconds: 100),
+      vsync: this,
+    )
+      ..repeat();
+
+    // Initialize with some base amplitudes
+    _initializeAmplitudes();
+  }
+
+  void _initializeAmplitudes() {
+    final patternCount = (widget.width / 60).ceil(); // Each pattern is ~60px wide
+    _amplitudes.clear();
+    for (int i = 0; i < patternCount; i++) {
+      _amplitudes.add(0.1); // Start with low amplitude
+    }
+  }
+
+  Future<void> _startAmplitudeMonitoring() async {
+    try {
+      if (await _amplitudeRecord.hasPermission()) {
+        // Start recording to temporary location for amplitude monitoring
+        final tempDir = await getTemporaryDirectory();
+        await _amplitudeRecord.start(
+            const RecordConfig(
+              encoder: AudioEncoder.aacLc,
+              bitRate: 128000,
+              sampleRate: 44100,
+            ),
+            path: '${tempDir.path}/temp_amplitude.m4a'
+        );
+
+        // Monitor amplitude periodically
+        _amplitudeMonitorTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) async {
+          if (await _amplitudeRecord.isRecording()) {
+            final amplitude = await _amplitudeRecord.getAmplitude();
+            // Normalize amplitude - record package typically gives values between -50 to 0 dB
+            // Convert to 0.0 - 1.0 range
+            final normalizedAmplitude = ((amplitude.current + 50) / 50).clamp(0.0, 1.0);
+            if (mounted) {
+              setState(() {
+                _currentAmplitude = normalizedAmplitude;
+              });
+            }
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint('Error starting amplitude monitoring: $e');
+    }
+  }
+
+  Future<void> _stopAmplitudeMonitoring() async {
+    try {
+      _amplitudeMonitorTimer?.cancel();
+      _amplitudeMonitorTimer = null;
+      if (await _amplitudeRecord.isRecording()) {
+        await _amplitudeRecord.stop();
+      }
+      setState(() {
+        _currentAmplitude = 0.0;
+      });
+    } catch (e) {
+      debugPrint('Error stopping amplitude monitoring: $e');
+    }
+  }
+
+  @override
+  void didUpdateWidget(CustomWaveformWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (widget.isRecording && !oldWidget.isRecording) {
+      _startAmplitudeTracking();
+      _startAmplitudeMonitoring();
+    } else if (!widget.isRecording && oldWidget.isRecording) {
+      _stopAmplitudeTracking();
+      _stopAmplitudeMonitoring();
+    }
+
+    if (widget.width != oldWidget.width) {
+      _initializeAmplitudes();
+    }
+  }
+
+  void _startAmplitudeTracking() {
+    _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
+      if (widget.recorderController != null && mounted && widget.isRecording) {
+        setState(() {
+          // Shift amplitudes left and add new one based on real microphone input
+          if (_amplitudes.isNotEmpty) {
+            _amplitudes.removeAt(0);
+            // Use actual amplitude from microphone, with a minimum base level for visibility
+            final amplitudeToAdd = math.max(0.1, _currentAmplitude * 0.8 + 0.2);
+            _amplitudes.add(amplitudeToAdd);
+          }
+        });
+      }
+    });
+  }
+
+  void _stopAmplitudeTracking() {
+    _amplitudeTimer?.cancel();
+    _amplitudeTimer = null;
+  }
+
+  @override
+  void dispose() {
+    _animationController.dispose();
+    _amplitudeTimer?.cancel();
+    _amplitudeMonitorTimer?.cancel();
+    _amplitudeRecord.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: widget.width,
+      height: widget.height,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12.0),
+        color: const Color(0xFF1E1B26),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0x4D000000),
+            blurRadius: 8,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12.0),
+        child: CustomPaint(
+          painter: WaveformPainter(
+            amplitudes: _amplitudes,
+            isRecording: widget.isRecording,
+            isPlaying: widget.isPlaying,
+            currentDuration: widget.currentDuration,
+            maxDuration: widget.playerController?.maxDuration ?? 1000,
+            animation: _animationController,
+          ),
+          size: Size(widget.width, widget.height),
+        ),
+      ),
+    );
+  }
+}
+
+class WaveformPainter extends CustomPainter {
+  final List<double> amplitudes;
+  final bool isRecording;
+  final bool isPlaying;
+  final int currentDuration;
+  final int maxDuration;
+  final Animation<double> animation;
+
+  WaveformPainter({
+    required this.amplitudes,
+    required this.isRecording,
+    required this.isPlaying,
+    required this.currentDuration,
+    required this.maxDuration,
+    required this.animation,
+  }) : super(repaint: animation);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.blue
+      ..strokeWidth = 2.0
+      ..style = PaintingStyle.fill;
+
+    // Draw background
+    final backgroundPaint = Paint()
+      ..color = const Color(0xFF1E1B26);
+    canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), backgroundPaint);
+
+    // Calculate pattern dimensions
+    const patternWidth = 60.0;
+    const patternHeight = 40.0;
+    final centerY = size.height / 2;
+
+    // Calculate number of complete patterns that fit
+    final patternCount = (size.width / patternWidth).floor();
+
+    for (int i = 0; i < patternCount && i < amplitudes.length; i++) {
+      final x = i * patternWidth + (patternWidth / 2);
+      final amplitude = amplitudes[i];
+
+      // Calculate progress for playback indicator
+      double progress = 0.0;
+      if (isPlaying && maxDuration > 0) {
+        progress = currentDuration / maxDuration;
+      }
+
+      // Determine if this pattern should be highlighted
+      final patternProgress = i / patternCount;
+      final isActive = isRecording || (isPlaying && patternProgress <= progress);
+
+      // Set color based on state
+      if (isActive) {
+        paint.color = isRecording
+            ? Colors.red.withOpacity(0.8 + 0.2 * math.sin(animation.value * 2 * math.pi))
+            : Colors.blue;
+      } else {
+        paint.color = Colors.grey.withOpacity(0.3);
+      }
+
+      // Draw the cross/plus pattern (similar to your image)
+      _drawCrossPattern(canvas, paint, x, centerY, amplitude, patternHeight);
+    }
+  }
+
+  void _drawCrossPattern(Canvas canvas, Paint paint, double centerX, double centerY, double amplitude, double maxHeight) {
+    // Scale the pattern based on amplitude
+    final scaledHeight = maxHeight * amplitude;
+    final halfHeight = scaledHeight / 2;
+
+    // Draw vertical line
+    canvas.drawLine(
+      Offset(centerX, centerY - halfHeight),
+      Offset(centerX, centerY + halfHeight),
+      paint,
+    );
+
+    // Draw horizontal line
+    final horizontalWidth = scaledHeight * 0.6; // Make horizontal line proportional
+    canvas.drawLine(
+      Offset(centerX - horizontalWidth / 2, centerY),
+      Offset(centerX + horizontalWidth / 2, centerY),
+      paint,
+    );
+
+    // Add some additional cross patterns for visual richness
+    if (amplitude > 0.5) {
+      // Draw smaller crosses around the main one
+      final smallCrossSize = scaledHeight * 0.3;
+      final smallCrossOffset = horizontalWidth * 0.8;
+
+      // Left small cross
+      _drawSmallCross(canvas, paint, centerX - smallCrossOffset, centerY, smallCrossSize);
+
+      // Right small cross
+      _drawSmallCross(canvas, paint, centerX + smallCrossOffset, centerY, smallCrossSize);
+
+      if (amplitude > 0.7) {
+        // Top crosses
+        _drawSmallCross(canvas, paint, centerX - smallCrossOffset / 2, centerY - halfHeight * 0.6, smallCrossSize * 0.7);
+        _drawSmallCross(canvas, paint, centerX + smallCrossOffset / 2, centerY - halfHeight * 0.6, smallCrossSize * 0.7);
+
+        // Bottom crosses
+        _drawSmallCross(canvas, paint, centerX - smallCrossOffset / 2, centerY + halfHeight * 0.6, smallCrossSize * 0.7);
+        _drawSmallCross(canvas, paint, centerX + smallCrossOffset / 2, centerY + halfHeight * 0.6, smallCrossSize * 0.7);
+      }
+    }
+  }
+
+  void _drawSmallCross(Canvas canvas, Paint paint, double centerX, double centerY, double size) {
+    final halfSize = size / 2;
+
+    // Vertical line
+    canvas.drawLine(
+      Offset(centerX, centerY - halfSize),
+      Offset(centerX, centerY + halfSize),
+      paint,
+    );
+
+    // Horizontal line
+    canvas.drawLine(
+      Offset(centerX - halfSize, centerY),
+      Offset(centerX + halfSize, centerY),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(WaveformPainter oldDelegate) {
+    return oldDelegate.amplitudes != amplitudes ||
+        oldDelegate.isRecording != isRecording ||
+        oldDelegate.isPlaying != isPlaying ||
+        oldDelegate.currentDuration != currentDuration ||
+        oldDelegate.maxDuration != maxDuration;
+  }
+}
 
 class VoiceRecorderScreen extends StatefulWidget {
   const VoiceRecorderScreen({super.key});
@@ -485,39 +809,14 @@ class _VoiceRecorderScreenState extends State<VoiceRecorderScreen> {
             child: Center(
               child: RepaintBoundary(
                 key: _waveformKey,
-                child: Container(
+                child: CustomWaveformWidget(
+                  recorderController: _recordController,
+                  playerController: _playerController,
+                  isRecording: _isRecording,
+                  isPlaying: _isPlaying,
+                  currentDuration: _currentDuration,
                   width: 720, // Fixed even width for consistent video output
                   height: 120,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(12.0),
-                    color: const Color(0xFF1E1B26),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0x4D000000),
-                        blurRadius: 8,
-                        offset: const Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: AudioWaveforms(
-                    enableGesture: false,
-                    size: const Size(680, 100),
-                    // Fixed size for consistency
-                    recorderController: _recordController,
-                    waveStyle: const WaveStyle(
-                      waveColor: Colors.blue,
-                      extendWaveform: false,
-                      middleLineColor: Colors.transparent,
-                      showMiddleLine: false,
-                      waveCap: StrokeCap.round,
-                      waveThickness: 3.0,
-                    ),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(12.0),
-                      color: const Color(0xFF1E1B26),
-                    ),
-                    padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-                  ),
                 ),
               ),
             ),
@@ -579,7 +878,7 @@ class _VoiceRecorderScreenState extends State<VoiceRecorderScreen> {
                 border: Border.all(color: const Color(0x4D2196F3)),
               ),
               child: Text(
-                'Captured ${_capturedFrames.length} frames for video generation',
+                'Captured ${_capturedFrames.length} (${(_capturedFrames.length/30).toInt()}) frames for video generation',
                 style: TextStyle(
                   color: Colors.blue.shade700,
                   fontSize: 12,
