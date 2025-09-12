@@ -60,7 +60,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   }
 
   void _initializeAmplitudes() {
-    final patternCount = (widget.width / 60).ceil(); // Each pattern is ~60px wide
+    final patternCount = (widget.width / 20).ceil(); // Each column is ~20px wide now
     _amplitudes.clear();
     for (int i = 0; i < patternCount; i++) {
       _amplitudes.add(0.1); // Start with low amplitude
@@ -217,26 +217,31 @@ class WaveformPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = Colors.blue
-      ..strokeWidth = 2.0
-      ..style = PaintingStyle.fill;
+      ..color = Colors.green
+      ..strokeWidth = 1.5
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
 
     // Draw background
     final backgroundPaint = Paint()
       ..color = const Color(0xFF1E1B26);
     canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), backgroundPaint);
 
-    // Calculate pattern dimensions
-    const patternWidth = 60.0;
-    const patternHeight = 40.0;
-    final centerY = size.height / 2;
+    // Grid configuration to match screenshot pattern
+    const double crossSize = 8.0; // Size of each cross
+    const double horizontalSpacing = 20.0; // Space between columns
+    const double verticalSpacing = 12.0; // Space between rows
+    final double centerY = size.height / 2;
 
-    // Calculate number of complete patterns that fit
-    final patternCount = (size.width / patternWidth).floor();
+    // Calculate maximum number of crosses that can fit vertically
+    const int maxVerticalCrosses = 7; // Based on screenshot pattern
 
-    for (int i = 0; i < patternCount && i < amplitudes.length; i++) {
-      final x = i * patternWidth + (patternWidth / 2);
-      final amplitude = amplitudes[i];
+    // Calculate number of columns that fit across the width
+    final int columnCount = (size.width / horizontalSpacing).floor();
+
+    for (int col = 0; col < columnCount && col < amplitudes.length; col++) {
+      final amplitude = amplitudes[col];
+      final x = col * horizontalSpacing + horizontalSpacing / 2;
 
       // Calculate progress for playback indicator
       double progress = 0.0;
@@ -244,79 +249,59 @@ class WaveformPainter extends CustomPainter {
         progress = currentDuration / maxDuration;
       }
 
-      // Determine if this pattern should be highlighted
-      final patternProgress = i / patternCount;
-      final isActive = isRecording || (isPlaying && patternProgress <= progress);
+      // Determine if this column should be highlighted
+      final columnProgress = col / columnCount;
+      final isActive = isRecording || (isPlaying && columnProgress <= progress);
 
       // Set color based on state
       if (isActive) {
         paint.color = isRecording
-            ? Colors.red.withOpacity(0.8 + 0.2 * math.sin(animation.value * 2 * math.pi))
-            : Colors.blue;
+            ? Color.lerp(Colors.green, Colors.lightGreen,
+            0.5 + 0.5 * math.sin(animation.value * 2 * math.pi))!
+            : Colors.green;
       } else {
-        paint.color = Colors.grey.withOpacity(0.3);
+        paint.color = Colors.green.withOpacity(0.3);
       }
 
-      // Draw the cross/plus pattern (similar to your image)
-      _drawCrossPattern(canvas, paint, x, centerY, amplitude, patternHeight);
+      // Calculate number of crosses to draw vertically based on amplitude
+      // Amplitude 0.0-1.0 maps to 1-maxVerticalCrosses crosses
+      final int crossCount = math.max(1, (amplitude * maxVerticalCrosses).round());
+
+      // Draw crosses in a vertical column
+      _drawCrossColumn(
+          canvas,
+          paint,
+          x,
+          centerY,
+          crossCount,
+          crossSize,
+          verticalSpacing);
     }
   }
 
-  void _drawCrossPattern(Canvas canvas, Paint paint, double centerX, double centerY, double amplitude, double maxHeight) {
-    // Scale the pattern based on amplitude
-    final scaledHeight = maxHeight * amplitude;
-    final halfHeight = scaledHeight / 2;
+  void _drawCrossColumn(Canvas canvas, Paint paint, double centerX, double centerY,
+      int crossCount, double crossSize, double verticalSpacing) {
+    // Calculate starting Y position to center the column
+    final double totalHeight = (crossCount - 1) * verticalSpacing;
+    final double startY = centerY - totalHeight / 2;
 
-    // Draw vertical line
-    canvas.drawLine(
-      Offset(centerX, centerY - halfHeight),
-      Offset(centerX, centerY + halfHeight),
-      paint,
-    );
-
-    // Draw horizontal line
-    final horizontalWidth = scaledHeight * 0.6; // Make horizontal line proportional
-    canvas.drawLine(
-      Offset(centerX - horizontalWidth / 2, centerY),
-      Offset(centerX + horizontalWidth / 2, centerY),
-      paint,
-    );
-
-    // Add some additional cross patterns for visual richness
-    if (amplitude > 0.5) {
-      // Draw smaller crosses around the main one
-      final smallCrossSize = scaledHeight * 0.3;
-      final smallCrossOffset = horizontalWidth * 0.8;
-
-      // Left small cross
-      _drawSmallCross(canvas, paint, centerX - smallCrossOffset, centerY, smallCrossSize);
-
-      // Right small cross
-      _drawSmallCross(canvas, paint, centerX + smallCrossOffset, centerY, smallCrossSize);
-
-      if (amplitude > 0.7) {
-        // Top crosses
-        _drawSmallCross(canvas, paint, centerX - smallCrossOffset / 2, centerY - halfHeight * 0.6, smallCrossSize * 0.7);
-        _drawSmallCross(canvas, paint, centerX + smallCrossOffset / 2, centerY - halfHeight * 0.6, smallCrossSize * 0.7);
-
-        // Bottom crosses
-        _drawSmallCross(canvas, paint, centerX - smallCrossOffset / 2, centerY + halfHeight * 0.6, smallCrossSize * 0.7);
-        _drawSmallCross(canvas, paint, centerX + smallCrossOffset / 2, centerY + halfHeight * 0.6, smallCrossSize * 0.7);
-      }
+    for (int i = 0; i < crossCount; i++) {
+      final double y = startY + i * verticalSpacing;
+      _drawSingleCross(canvas, paint, centerX, y, crossSize);
     }
   }
 
-  void _drawSmallCross(Canvas canvas, Paint paint, double centerX, double centerY, double size) {
+  void _drawSingleCross(Canvas canvas, Paint paint, double centerX, double centerY, double size) {
     final halfSize = size / 2;
 
-    // Vertical line
+    // Draw vertical line of the cross
     canvas.drawLine(
       Offset(centerX, centerY - halfSize),
       Offset(centerX, centerY + halfSize),
       paint,
     );
 
-    // Horizontal line
+    // Draw horizontal line of the cross
     canvas.drawLine(
       Offset(centerX - halfSize, centerY),
       Offset(centerX + halfSize, centerY),
