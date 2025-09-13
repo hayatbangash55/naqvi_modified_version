@@ -80,16 +80,72 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   ui.Image? _logoImage;
   VoidCallback? _playbackListener;
 
+  // Smooth playback lerp state
+  static const int _playbackLerpMs = 90; // duration of interpolation between updates
+  List<double>? _prevAmpsLerp;
+  List<double>? _targetAmpsLerp;
+  DateTime? _lerpStart;
+
   @override
   void initState() {
     super.initState();
     _animationController = AnimationController(
       duration: const Duration(milliseconds: 100),
       vsync: this,
-    )..repeat();
+    )..addListener(_onAnimTick)
+     ..repeat();
     _initializeAmplitudes();
     _loadLogoImage();
     _attachPlaybackListener();
+  }
+
+  // Drive interpolation while playing for smoother column changes
+  void _onAnimTick() {
+    if (!mounted) return;
+    if (!widget.isPlaying) return;
+    if (_prevAmpsLerp == null || _targetAmpsLerp == null || _lerpStart == null) return;
+
+    final elapsed = DateTime.now().difference(_lerpStart!).inMilliseconds;
+    final t = (elapsed / _playbackLerpMs).clamp(0.0, 1.0);
+
+    final prev = _prevAmpsLerp!;
+    final target = _targetAmpsLerp!;
+    final n = math.min(prev.length, target.length);
+
+    // Linear interpolation per column
+    final blended = List<double>.generate(
+      n,
+      (i) {
+        final a = prev[i];
+        final b = target[i];
+        return (a + (b - a) * t).clamp(0.0, 1.0);
+      },
+      growable: false,
+    );
+
+    // Only setState if something actually changed to avoid extra rebuilds
+    if (_amplitudes.length != blended.length ||
+        !_listAlmostEqual(_amplitudes, blended)) {
+      setState(() {
+        _amplitudes
+          ..clear()
+          ..addAll(blended);
+      });
+    }
+
+    if (t >= 1.0) {
+      // End of blend window; hold at target until next update arrives
+      _prevAmpsLerp = List<double>.from(blended);
+      _lerpStart = null;
+    }
+  }
+
+  bool _listAlmostEqual(List<double> a, List<double> b, {double eps = 1e-3}) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if ((a[i] - b[i]).abs() > eps) return false;
+    }
+    return true;
   }
 
   void _attachPlaybackListener() {
@@ -111,11 +167,17 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
             tail = List.filled(patternCount - tail.length, 0.0)..addAll(tail);
           }
         }
-        setState(() {
-          _amplitudes
-            ..clear()
-            ..addAll(tail.map((e) => e.clamp(0.0, 1.0)));
-        });
+        // Normalize current amplitudes to patternCount for a stable lerp base
+        final current = List<double>.generate(patternCount, (i) {
+          final idx = _amplitudes.length - patternCount + i;
+          final v = (idx >= 0 && idx < _amplitudes.length) ? _amplitudes[idx] : 0.0;
+          return v.clamp(0.0, 1.0);
+        }, growable: false);
+
+        // Setup lerp towards new tail
+        _prevAmpsLerp = current;
+        _targetAmpsLerp = tail.map((e) => e.clamp(0.0, 1.0)).toList(growable: false);
+        _lerpStart = DateTime.now();
       }
       srcListenable.addListener(listener);
       _playbackListener = () => srcListenable.removeListener(listener);
@@ -127,6 +189,11 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
     _amplitudes
       ..clear()
       ..addAll(List.filled(patternCount, 0.05));
+
+    // Reset lerp state on geometry/recording changes
+    _prevAmpsLerp = null;
+    _targetAmpsLerp = null;
+    _lerpStart = null;
 
     // Only run shifting timer during recording
     _amplitudeTimer?.cancel();
