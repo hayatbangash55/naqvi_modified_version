@@ -10,7 +10,6 @@ import 'package:share_plus/share_plus.dart';
 import 'package:audio_waveforms/audio_waveforms.dart';
 import 'package:record/record.dart';
 import 'dart:io';
-import 'dart:typed_data'; // NEW for Uint8List
 import 'dart:ui' as ui;
 import 'dart:math' as math;
 import 'package:flutter/services.dart';
@@ -437,7 +436,6 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   late ScrollController _scrollController;
   final List<String> _capturedFrames = []; // Store captured frames
   Timer? _frameCaptureTimer;
-  static const int _targetFPS = 30; // Target frame rate for video
   int _frameCount = 0;
   final AudioRecorder _mic = AudioRecorder(); // use concrete AudioRecorder
   Timer? _ampTimer; // amplitude polling
@@ -823,7 +821,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
 
       // Input framerate (as captured), clamp to a sane range
       final inFps = calculatedFPS.clamp(10, 20); // Lower range for speed
-      const int outFps = 24; // Reduced output FPS for speed (was 30)
+      const int outFps = 15; // Lower output FPS for speed and size
 
       debugPrint(
           'Audio duration: ${(durMs / 1000).toStringAsFixed(2)}s, Frames: ${_capturedFrames.length}, In FPS: $inFps, Out FPS: $outFps');
@@ -834,30 +832,32 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       // Rename frames to match the expected pattern
       await _renameFramesSequentially();
 
-      // Ultra-fast video generation optimized for speed over quality
-      final vf = 'fps=$outFps,scale=480:854:force_original_aspect_ratio=decrease,pad=480:854:(ow-iw)/2:(oh-ih)/2:color=0x01004E';
+      // Much smaller resolution and frame rate; pad to consistent 9:16 canvas
+      final vf = 'fps=$outFps,scale=360:640:force_original_aspect_ratio=decrease,pad=360:640:(ow-iw)/2:(oh-ih)/2:color=0x01004E';
 
       final command = [
         '-y', // Overwrite output file
         '-framerate', '$inFps', // Input sequence framerate (as captured)
         '-i', framePattern, // Input frames pattern
         '-i', _filePath!, // Input audio
-        '-vf', vf, // Much smaller resolution (480x854 instead of 1080x1920)
+        '-map', '0:v:0', // ensure proper stream mapping
+        '-map', '1:a:0',
+        '-vf', vf, // Small 360x640 canvas
         '-c:v', 'libx264', // Video codec
-        '-preset', 'ultrafast', // Absolute fastest encoding
-        '-crf', '35', // Much lower quality for speed (was 23)
+        '-preset', 'ultrafast', // Fastest encoding
         '-tune', 'zerolatency', // Optimize for speed
+        '-crf', '36', // Lower quality -> smaller file
+        '-pix_fmt', 'yuv420p', // Compatibility
         '-c:a', 'aac', // Audio codec
-        '-b:a', '64k', // Very low audio bitrate for speed (was 128k)
-        '-pix_fmt', 'yuv420p', // Pixel format for compatibility
+        '-ac', '1', // Mono audio
+        '-b:a', '48k', // Low audio bitrate
         '-shortest', // Match shortest stream duration
-        '-movflags', '+faststart', // Optimize for web playback
+        '-movflags', '+faststart', // Web playback
         '-threads', '0', // Use all CPU cores
-        '-bf', '0', // No B-frames for faster encoding
-        '-g', '30', // Keyframe interval for speed
+        '-g', '30', // Keyframe interval
         '-sc_threshold', '0', // Disable scene change detection
-        '-maxrate', '2M', // Low bitrate limit
-        '-bufsize', '4M', // Small buffer size
+        '-maxrate', '900k', // Constrain bitrate for size
+        '-bufsize', '1800k',
         videoPath
       ].join(' ');
 
@@ -958,6 +958,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Color(0xFF01004E),
       appBar: AppBar(
         title: const Text('Custom Voice Recorder'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
@@ -970,11 +971,11 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
             Container(
               padding: const EdgeInsets.all(16),
               margin: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0x1AFF0000),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: const Color(0x4DFF0000)),
-              ),
+              // decoration: BoxDecoration(
+              //   color: const Color(0x1AFF0000),
+              //   borderRadius: BorderRadius.circular(8),
+              //   border: Border.all(color: const Color(0x4DFF0000)),
+              // ),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -1135,15 +1136,3 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   }
 }
 
-// Top-level payload and writer used by compute() to avoid unsendable closures
-class _FileWritePayload {
-  final String path;
-  final Uint8List bytes;
-  const _FileWritePayload(this.path, this.bytes);
-}
-
-Future<bool> _writePngToFile(_FileWritePayload payload) async {
-  final file = File(payload.path);
-  await file.writeAsBytes(payload.bytes, flush: false);
-  return true;
-}
