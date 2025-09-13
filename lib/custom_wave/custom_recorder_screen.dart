@@ -44,6 +44,9 @@ class CustomWaveformWidget extends StatefulWidget {
   // NEW: enforce visible logo size
   final double minLogoSize;
 
+  // NEW: playback samples up to current time
+  final ValueListenable<List<double>>? playbackAmps;
+
   const CustomWaveformWidget({
     super.key,
     this.recorderController,
@@ -62,6 +65,7 @@ class CustomWaveformWidget extends StatefulWidget {
     this.verticalGap = 6.0,
     this.amplitudeDensityDivisor = 12.0,
     this.minLogoSize = 16.0, // NEW default
+    this.playbackAmps, // NEW
   });
 
   @override
@@ -74,6 +78,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   final List<double> _amplitudes = [];
   Timer? _amplitudeTimer;
   ui.Image? _logoImage;
+  VoidCallback? _playbackListener;
 
   @override
   void initState() {
@@ -84,6 +89,37 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
     )..repeat();
     _initializeAmplitudes();
     _loadLogoImage();
+    _attachPlaybackListener();
+  }
+
+  void _attachPlaybackListener() {
+    _playbackListener?.call();
+    _playbackListener = null;
+    final srcListenable = widget.playbackAmps; // capture current listenable
+    if (srcListenable != null) {
+      void listener() {
+        if (!mounted) return;
+        final patternCount = (widget.width / widget.amplitudeDensityDivisor).ceil().clamp(1, 10000);
+        final src = srcListenable.value; // use captured listenable, not widget.playbackAmps
+        List<double> tail;
+        if (src.isEmpty) {
+          tail = List.filled(patternCount, 0.0);
+        } else {
+          final start = src.length > patternCount ? src.length - patternCount : 0;
+          tail = src.sublist(start);
+          if (tail.length < patternCount) {
+            tail = List.filled(patternCount - tail.length, 0.0)..addAll(tail);
+          }
+        }
+        setState(() {
+          _amplitudes
+            ..clear()
+            ..addAll(tail.map((e) => e.clamp(0.0, 1.0)));
+        });
+      }
+      srcListenable.addListener(listener);
+      _playbackListener = () => srcListenable.removeListener(listener);
+    }
   }
 
   void _initializeAmplitudes() {
@@ -92,18 +128,20 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
       ..clear()
       ..addAll(List.filled(patternCount, 0.05));
 
-    // Timer to shift columns using provided amplitude
+    // Only run shifting timer during recording
     _amplitudeTimer?.cancel();
-    _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
-      if (!mounted) return;
-      final live = widget.amplitude.value.clamp(0.0, 1.0);
-      setState(() {
-        if (_amplitudes.isNotEmpty) {
-          _amplitudes.removeAt(0);
-          _amplitudes.add(live);
-        }
+    if (widget.isRecording) {
+      _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
+        if (!mounted) return;
+        final live = widget.amplitude.value.clamp(0.0, 1.0);
+        setState(() {
+          if (_amplitudes.isNotEmpty) {
+            _amplitudes.removeAt(0);
+            _amplitudes.add(live);
+          }
+        });
       });
-    });
+    }
   }
 
   void _loadLogoImage() async {
@@ -121,8 +159,11 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   @override
   void didUpdateWidget(CustomWaveformWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.width != oldWidget.width) {
+    if (widget.width != oldWidget.width || widget.isRecording != oldWidget.isRecording) {
       _initializeAmplitudes();
+    }
+    if (widget.playbackAmps != oldWidget.playbackAmps) {
+      _attachPlaybackListener();
     }
   }
 
@@ -130,6 +171,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   void dispose() {
     _animationController.dispose();
     _amplitudeTimer?.cancel();
+    _playbackListener?.call();
     super.dispose();
   }
 
@@ -346,6 +388,11 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   DateTime? _recordStart;
   Duration _recordElapsed = Duration.zero;
 
+  // History of recorded amplitudes sampled every kAmpSampleMs during recording
+  final List<double> _ampHistory = []; // NEW
+  static const int kAmpSampleMs = 50; // NEW: matches _ampTimer period
+  final ValueNotifier<List<double>> _playbackAmps = ValueNotifier<List<double>>([]); // NEW
+
   @override
   void initState() {
     super.initState();
@@ -373,13 +420,15 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
           _isPlaying = false;
           _currentDuration = 0;
         });
-        if (_scrollController.hasClients) { // Ensure the ScrollController is attached
+        if (_scrollController.hasClients) {
           _scrollController.animateTo(
             0,
             duration: const Duration(milliseconds: 200),
             curve: Curves.easeOut,
           );
         }
+        // Reset playback window when stopped
+        _playbackAmps.value = [];
       }
     });
 
@@ -389,14 +438,14 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         setState(() => _currentDuration = duration);
         if (_currentDuration >= _playerController.maxDuration) {
           setState(() => _isPlaying = false);
-          if (_scrollController.hasClients) { // Ensure the ScrollController is attached
+          if (_scrollController.hasClients) {
             _scrollController.animateTo(
               0,
               duration: const Duration(milliseconds: 200),
               curve: Curves.easeOut,
             );
           }
-        } else if (_isPlaying && _scrollController.hasClients) { // Ensure the ScrollController is attached
+        } else if (_isPlaying && _scrollController.hasClients) {
           // Calculate scroll position based on progress
           final scrollPosition = (_currentDuration / _playerController.maxDuration) *
               (_scrollController.position.maxScrollExtent);
@@ -405,6 +454,11 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
             duration: const Duration(milliseconds: 100),
             curve: Curves.linear,
           );
+        }
+        // NEW: update playback window for custom waveform
+        if (_isPlaying && _ampHistory.isNotEmpty) {
+          final idx = (_currentDuration / kAmpSampleMs).floor().clamp(0, _ampHistory.length);
+          _playbackAmps.value = List.unmodifiable(_ampHistory.sublist(0, idx));
         }
       },
     );
@@ -470,6 +524,8 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         _frameCount = 0;
         _smoothedAmp = 0.0; // reset smoothing at start
         _amp.value = 0.0;
+        _ampHistory.clear(); // NEW reset history
+        _playbackAmps.value = []; // NEW reset playback window
         // start stopwatch
         _recordStart = DateTime.now();
         _recordElapsed = Duration.zero;
@@ -486,26 +542,25 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
 
       // Start amplitude polling
       _ampTimer?.cancel();
-      _ampTimer = Timer.periodic(const Duration(milliseconds: 50), (_) async {
+      _ampTimer = Timer.periodic(const Duration(milliseconds: kAmpSampleMs), (_) async {
         try {
           if (await _mic.isRecording()) {
             final amplitude = await _mic.getAmplitude();
             final db = amplitude.current;
             final minDb = kNoiseFloorDb;
-            // Noise gate + normalization 0..1
             double target = db <= minDb ? 0.0 : ((db - minDb) / (0.0 - minDb)).clamp(0.0, 1.0);
-            // Attack/Release EMA
             if (target > _smoothedAmp) {
               _smoothedAmp += kAmpAttack * (target - _smoothedAmp);
             } else {
               _smoothedAmp += kAmpRelease * (target - _smoothedAmp);
             }
-            // Gamma curve, optional quantization
             double mapped = math.pow(_smoothedAmp.clamp(0.0, 1.0), kAmpGamma).toDouble();
             if (kAmpQuantSteps > 0) {
               mapped = (mapped * kAmpQuantSteps).round() / kAmpQuantSteps;
             }
-            _amp.value = mapped.clamp(0.0, 1.0);
+            final clamped = mapped.clamp(0.0, 1.0);
+            _ampHistory.add(clamped); // NEW collect history
+            _amp.value = clamped;
           }
         } catch (_) {}
       });
@@ -906,6 +961,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
                         verticalGap: kVerticalGap,
                         amplitudeDensityDivisor: kAmplitudeDensityDivisor,
                         minLogoSize: kMinLogoSize, // NEW
+                        playbackAmps: _isPlaying ? _playbackAmps : null, // NEW
                       ),
                     );
                   },
