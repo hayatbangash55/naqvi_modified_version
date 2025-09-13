@@ -1,71 +1,19 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
-import 'package:flutter/foundation.dart'; // for ValueListenable/ValueNotifier and compute()
-import 'package:just_audio/just_audio.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/return_code.dart';
-import 'package:share_plus/share_plus.dart';
-import 'package:audio_waveforms/audio_waveforms.dart';
-import 'package:record/record.dart';
-import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'dart:ui' as ui;
 import 'dart:math' as math;
 import 'package:flutter/services.dart';
+import 'package:get/get.dart';
+import 'recorder_controller.dart';
 
-// Custom Waveform Widget
+// Custom Waveform Widget (GetX-driven)
 class CustomWaveformWidget extends StatefulWidget {
-  final RecorderController? recorderController;
-  final PlayerController? playerController;
-  final bool isRecording;
-  final bool isPlaying;
-  final int currentDuration;
   final double width;
   final double height;
-  final String logoAssetPath;
-  final ValueListenable<double> amplitude; // NEW: live amplitude 0..1
-  final Color backgroundColor; // NEW: solid bg color
-  final Color? logoTint; // NEW: optional logo tint
 
-  // NEW: controls logo size (lower => bigger logos)
-  final int maxVerticalLogos;
-
-  // NEW: spacing between columns
-  final double horizontalGap;
-
-  // NEW: spacing between stacked logos
-  final double verticalGap;
-
-  // NEW: controls number of columns in amplitude buffer
-  final double amplitudeDensityDivisor;
-
-  // NEW: enforce visible logo size
-  final double minLogoSize;
-
-  // NEW: playback samples up to current time
-  final ValueListenable<List<double>>? playbackAmps;
-
-  const CustomWaveformWidget({
-    super.key,
-    this.recorderController,
-    this.playerController,
-    required this.isRecording,
-    required this.isPlaying,
-    required this.currentDuration,
-    required this.width,
-    required this.height,
-    required this.logoAssetPath,
-    required this.amplitude,
-    this.backgroundColor = const Color(0xFF01004E), // NEW default
-    this.logoTint, // NEW
-    this.maxVerticalLogos = 30, // default previous behavior
-    this.horizontalGap = 10.0,
-    this.verticalGap = 6.0,
-    this.amplitudeDensityDivisor = 12.0,
-    this.minLogoSize = 16.0, // NEW default
-    this.playbackAmps, // NEW
-  });
+  const CustomWaveformWidget({super.key, required this.width, required this.height});
 
   @override
   State<CustomWaveformWidget> createState() => _CustomWaveformWidgetState();
@@ -73,14 +21,17 @@ class CustomWaveformWidget extends StatefulWidget {
 
 class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
     with TickerProviderStateMixin {
+  late final RecorderGetxController controller = Get.find<RecorderGetxController>();
+
   late AnimationController _animationController;
   final List<double> _amplitudes = [];
   Timer? _amplitudeTimer;
   ui.Image? _logoImage;
   VoidCallback? _playbackListener;
+  bool _lastIsRecording = false;
 
   // Smooth playback lerp state
-  static const int _playbackLerpMs = 90; // duration of interpolation between updates
+  static const int _playbackLerpMs = 90;
   List<double>? _prevAmpsLerp;
   List<double>? _targetAmpsLerp;
   DateTime? _lerpStart;
@@ -101,7 +52,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   // Drive interpolation while playing for smoother column changes
   void _onAnimTick() {
     if (!mounted) return;
-    if (!widget.isPlaying) return;
+    if (!controller.isPlaying.value) return;
     if (_prevAmpsLerp == null || _targetAmpsLerp == null || _lerpStart == null) return;
 
     final elapsed = DateTime.now().difference(_lerpStart!).inMilliseconds;
@@ -111,7 +62,6 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
     final target = _targetAmpsLerp!;
     final n = math.min(prev.length, target.length);
 
-    // Linear interpolation per column
     final blended = List<double>.generate(
       n,
       (i) {
@@ -122,9 +72,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
       growable: false,
     );
 
-    // Only setState if something actually changed to avoid extra rebuilds
-    if (_amplitudes.length != blended.length ||
-        !_listAlmostEqual(_amplitudes, blended)) {
+    if (_amplitudes.length != blended.length || !_listAlmostEqual(_amplitudes, blended)) {
       setState(() {
         _amplitudes
           ..clear()
@@ -133,7 +81,6 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
     }
 
     if (t >= 1.0) {
-      // End of blend window; hold at target until next update arrives
       _prevAmpsLerp = List<double>.from(blended);
       _lerpStart = null;
     }
@@ -150,38 +97,35 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   void _attachPlaybackListener() {
     _playbackListener?.call();
     _playbackListener = null;
-    final srcListenable = widget.playbackAmps; // capture current listenable
-    if (srcListenable != null) {
-      void listener() {
-        if (!mounted) return;
-        final patternCount = _computeColumnCount().clamp(1, 10000);
-        final src = srcListenable.value; // use captured listenable, not widget.playbackAmps
-        List<double> tail;
-        if (src.isEmpty) {
-          tail = List.filled(patternCount, 0.0);
-        } else {
-          final start = src.length > patternCount ? src.length - patternCount : 0;
-          tail = src.sublist(start);
-          if (tail.length < patternCount) {
-            final padCount = patternCount - tail.length;
-            tail = List<double>.filled(padCount, 0.0, growable: true)..addAll(tail);
-          }
+    final srcListenable = controller.playbackAmps;
+    void listener() {
+      if (!mounted) return;
+      final patternCount = _computeColumnCount().clamp(1, 10000);
+      final src = srcListenable.value;
+      List<double> tail;
+      if (src.isEmpty) {
+        tail = List.filled(patternCount, 0.0);
+      } else {
+        final start = src.length > patternCount ? src.length - patternCount : 0;
+        tail = src.sublist(start);
+        if (tail.length < patternCount) {
+          final padCount = patternCount - tail.length;
+          tail = List<double>.filled(padCount, 0.0, growable: true)..addAll(tail);
         }
-        // Normalize current amplitudes to patternCount for a stable lerp base
-        final current = List<double>.generate(patternCount, (i) {
-          final idx = _amplitudes.length - patternCount + i;
-          final v = (idx >= 0 && idx < _amplitudes.length) ? _amplitudes[idx] : 0.0;
-          return v.clamp(0.0, 1.0);
-        }, growable: false);
-
-        // Setup lerp towards new tail
-        _prevAmpsLerp = current;
-        _targetAmpsLerp = tail.map((e) => e.clamp(0.0, 1.0)).toList(growable: false);
-        _lerpStart = DateTime.now();
       }
-      srcListenable.addListener(listener);
-      _playbackListener = () => srcListenable.removeListener(listener);
+      final current = List<double>.generate(patternCount, (i) {
+        final idx = _amplitudes.length - patternCount + i;
+        final v = (idx >= 0 && idx < _amplitudes.length) ? _amplitudes[idx] : 0.0;
+        return v.clamp(0.0, 1.0);
+      }, growable: false);
+
+      _prevAmpsLerp = current;
+      _targetAmpsLerp = tail.map((e) => e.clamp(0.0, 1.0)).toList(growable: false);
+      _lerpStart = DateTime.now();
     }
+
+    srcListenable.addListener(listener);
+    _playbackListener = () => srcListenable.removeListener(listener);
   }
 
   void _initializeAmplitudes() {
@@ -190,17 +134,15 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
       ..clear()
       ..addAll(List.filled(patternCount, 0.05));
 
-    // Reset lerp state on geometry/recording changes
     _prevAmpsLerp = null;
     _targetAmpsLerp = null;
     _lerpStart = null;
 
-    // Only run shifting timer during recording
     _amplitudeTimer?.cancel();
-    if (widget.isRecording) {
+    if (controller.isRecording.value) {
       _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 33), (_) {
         if (!mounted) return;
-        final live = widget.amplitude.value.clamp(0.0, 1.0);
+        final live = controller.amp.value.clamp(0.0, 1.0);
         setState(() {
           if (_amplitudes.isNotEmpty) {
             _amplitudes.removeAt(0);
@@ -213,7 +155,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
 
   void _loadLogoImage() async {
     try {
-      final data = await rootBundle.load(widget.logoAssetPath);
+      final data = await rootBundle.load(RecorderGetxController.kLogoAsset);
       final codec = await ui.instantiateImageCodec(data.buffer.asUint8List());
       final frame = await codec.getNextFrame();
       if (!mounted) return;
@@ -226,11 +168,9 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   @override
   void didUpdateWidget(CustomWaveformWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.width != oldWidget.width || widget.isRecording != oldWidget.isRecording) {
+    if (widget.width != oldWidget.width || widget.height != oldWidget.height) {
       _initializeAmplitudes();
-    }
-    if (widget.playbackAmps != oldWidget.playbackAmps) {
-      _attachPlaybackListener();
+      setState(() {});
     }
   }
 
@@ -244,56 +184,68 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: widget.width,
-      height: widget.height,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(12.0),
-        color: widget.backgroundColor, // solid bg
-        boxShadow: [
-          BoxShadow(
-            color: const Color(0x4D000000),
-            blurRadius: 8,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(12.0),
-        child: CustomPaint(
-          painter: WaveformLogoPainter(
-            amplitudes: _amplitudes,
-            isRecording: widget.isRecording,
-            isPlaying: widget.isPlaying,
-            currentDuration: widget.currentDuration,
-            maxDuration: widget.playerController?.maxDuration ?? 1000,
-            animation: (widget.isRecording || widget.isPlaying)
-                ? _animationController
-                : const AlwaysStoppedAnimation(0.0),
-            logoImage: _logoImage,
-            logoTint: widget.logoTint,
-            maxVerticalLogos: widget.maxVerticalLogos, // NEW
-            horizontalGap: widget.horizontalGap, // NEW
-            verticalGap: widget.verticalGap, // NEW
-            minLogoSize: widget.minLogoSize, // NEW
-          ),
-          size: Size(widget.width, widget.height),
+    // Detect recording state change to reset amplitudes/timer
+    final isRec = controller.isRecording.value;
+    if (isRec != _lastIsRecording) {
+      _lastIsRecording = isRec;
+      _initializeAmplitudes();
+    }
+
+    return Obx(() {
+      final isRecording = controller.isRecording.value;
+      final isPlaying = controller.isPlaying.value;
+      final currentDuration = controller.currentDuration.value;
+
+      return Container(
+        width: widget.width,
+        height: widget.height,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12.0),
+          color: RecorderGetxController.kWaveBgColor,
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x4D000000),
+              blurRadius: 8,
+              offset: Offset(0, 4),
+            ),
+          ],
         ),
-      ),
-    );
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12.0),
+          child: CustomPaint(
+            painter: WaveformLogoPainter(
+              amplitudes: _amplitudes,
+              isRecording: isRecording,
+              isPlaying: isPlaying,
+              currentDuration: currentDuration,
+              maxDuration: controller.playerController.maxDuration,
+              animation: (isRecording || isPlaying)
+                  ? _animationController
+                  : const AlwaysStoppedAnimation(0.0),
+              logoImage: _logoImage,
+              logoTint: RecorderGetxController.kLogoTintColor,
+              maxVerticalLogos: RecorderGetxController.kMaxVerticalLogos,
+              horizontalGap: RecorderGetxController.kHorizontalGap,
+              verticalGap: RecorderGetxController.kVerticalGap,
+              minLogoSize: RecorderGetxController.kMinLogoSize,
+            ),
+            size: Size(widget.width, widget.height),
+          ),
+        ),
+      );
+    });
   }
 
   int _computeColumnCount() {
-    // Mirror WaveformLogoPainter layout to keep amplitudes length == drawn columns
-    final rows = (((widget.height + widget.verticalGap) /
-                (widget.minLogoSize + widget.verticalGap))
+    final rows = (((widget.height + RecorderGetxController.kVerticalGap) /
+                (RecorderGetxController.kMinLogoSize + RecorderGetxController.kVerticalGap))
             .floor())
-        .clamp(1, widget.maxVerticalLogos);
-    final logoHeight = ((widget.height - (rows - 1) * widget.verticalGap) / rows)
-        .clamp(widget.minLogoSize, widget.height);
-    final perCol = logoHeight + widget.horizontalGap;
+        .clamp(1, RecorderGetxController.kMaxVerticalLogos);
+    final logoHeight = ((widget.height - (rows - 1) * RecorderGetxController.kVerticalGap) / rows)
+        .clamp(RecorderGetxController.kMinLogoSize, widget.height);
+    final perCol = logoHeight + RecorderGetxController.kHorizontalGap;
     final columnCount = perCol > 0
-        ? ((widget.width + widget.horizontalGap) / perCol).floor()
+        ? ((widget.width + RecorderGetxController.kHorizontalGap) / perCol).floor()
         : 0;
     return columnCount;
   }
@@ -413,400 +365,8 @@ class WaveformLogoPainter extends CustomPainter {
   }
 }
 
-class CustomRecorderScreen extends StatefulWidget {
+class CustomRecorderScreen extends GetView<RecorderGetxController> {
   const CustomRecorderScreen({super.key});
-
-  @override
-  State<CustomRecorderScreen> createState() => _CustomRecorderScreenState();
-}
-
-class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
-  final GlobalKey _waveformKey = GlobalKey(); // Key to capture waveform widget
-  late final RecorderController _recordController;
-  late final PlayerController _playerController;
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  String? _filePath;
-  String? _videoPath;
-  bool _isRecording = false;
-  bool _isPlaying = false;
-  bool _isGeneratingVideo = false;
-  StreamSubscription? _playerSubscription;
-  int _currentDuration = 0;
-  StreamSubscription? _durationSubscription;
-  late ScrollController _scrollController;
-  final List<String> _capturedFrames = []; // Store captured frames
-  Timer? _frameCaptureTimer;
-  int _frameCount = 0;
-  final AudioRecorder _mic = AudioRecorder(); // use concrete AudioRecorder
-  Timer? _ampTimer; // amplitude polling
-  final ValueNotifier<double> _amp = ValueNotifier<double>(0); // 0..1
-  bool _captureBusy = false; // throttle capture
-
-  // NEW: easy-to-edit colors
-  static const Color kWaveBgColor = Color(0xFF01004E);
-  static const Color? kLogoTintColor = null; // set to a Color to tint logo
-  static const String kLogoAsset = 'assets/images/logo.png'; // NEW: logo asset path
-
-  // NEW: amplitude smoothing constants (tweak to change rigidity)
-  static const double kNoiseFloorDb = -34.0; // higher gate -> less sensitivity
-  static const double kAmpAttack = 0.30;     // faster rise for responsiveness
-  static const double kAmpRelease = 0.12;    // faster fall
-  static const double kAmpGamma = 2.0;       // slightly less aggressive curve
-  static const int kAmpQuantSteps = 0;       // disable quantization for smooth video
-
-  // NEW: smoothed amplitude state
-  double _smoothedAmp = 0.0;
-
-  // NEW: spacing/size controls for the wave grid
-  static const int kMaxVerticalLogos = 20; // slight size decrease vs 18
-  static const double kHorizontalGap = 16.0; // keep spacing
-  static const double kVerticalGap = 10.0; // keep spacing
-  static const double kAmplitudeDensityDivisor = 16.0; // columns count (unchanged)
-  static const double kMinLogoSize = 22.0; // slightly smaller vs 24.0
-
-  // NEW: stopwatch-like timer for recording duration
-  Timer? _recordTimer;
-  DateTime? _recordStart;
-  Duration _recordElapsed = Duration.zero;
-
-  // History of recorded amplitudes sampled every kAmpSampleMs during recording
-  final List<double> _ampHistory = []; // NEW
-  static const int kAmpSampleMs = 33; // NEW: 30Hz to match capture FPS
-  final ValueNotifier<List<double>> _playbackAmps = ValueNotifier<List<double>>([]); // NEW
-
-  @override
-  void initState() {
-    super.initState();
-    _initRecorder();
-    _initPlayer();
-    _scrollController = ScrollController();
-  }
-
-  void _initRecorder() {
-    _recordController = RecorderController()
-      ..androidEncoder = AndroidEncoder.aac
-      ..androidOutputFormat = AndroidOutputFormat.mpeg4
-      ..iosEncoder = IosEncoder.kAudioFormatMPEG4AAC
-      ..sampleRate = 48000; // increased quality
-  }
-
-  void _initPlayer() {
-    _playerController = PlayerController();
-
-    // Listen to player state changes
-    _playerSubscription = _playerController.onPlayerStateChanged.listen((state) {
-      setState(() => _isPlaying = state.isPlaying);
-      if (state.isStopped) {
-        setState(() {
-          _isPlaying = false;
-          _currentDuration = 0;
-        });
-        if (_scrollController.hasClients) {
-          _scrollController.animateTo(
-            0,
-            duration: const Duration(milliseconds: 200),
-            curve: Curves.easeOut,
-          );
-        }
-        // Reset playback window when stopped
-        _playbackAmps.value = [];
-      }
-    });
-
-    // Listen to progress updates
-    _durationSubscription = _playerController.onCurrentDurationChanged.listen(
-      (duration) {
-        setState(() => _currentDuration = duration);
-        if (_currentDuration >= _playerController.maxDuration) {
-          setState(() => _isPlaying = false);
-          if (_scrollController.hasClients) {
-            _scrollController.animateTo(
-              0,
-              duration: const Duration(milliseconds: 200),
-              curve: Curves.easeOut,
-            );
-          }
-        } else if (_isPlaying && _scrollController.hasClients) {
-          // Calculate scroll position based on progress
-          final scrollPosition = (_currentDuration / _playerController.maxDuration) *
-              (_scrollController.position.maxScrollExtent);
-          _scrollController.animateTo(
-            scrollPosition,
-            duration: const Duration(milliseconds: 100),
-            curve: Curves.linear,
-          );
-        }
-        // NEW: update playback window for custom waveform
-        if (_isPlaying && _ampHistory.isNotEmpty) {
-          final idx = (_currentDuration / kAmpSampleMs).floor().clamp(0, _ampHistory.length);
-          _playbackAmps.value = List.unmodifiable(_ampHistory.sublist(0, idx));
-        }
-      },
-    );
-  }
-
-  @override
-  void dispose() {
-    _recordController.dispose();
-    _playerController.dispose();
-    _audioPlayer.dispose();
-    _playerSubscription?.cancel();
-    _durationSubscription?.cancel();
-    _scrollController.dispose();
-    _ampTimer?.cancel();
-    _mic.dispose();
-    _recordTimer?.cancel();
-    super.dispose();
-  }
-
-  Future<String> _getFilePath() async {
-    final dir = await getTemporaryDirectory();
-    return '${dir.path}/voice_message.m4a';
-  }
-
-  Future<String> _getVideoPath() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return '${dir.path}/waveform_video_${DateTime
-        .now()
-        .millisecondsSinceEpoch}.mp4';
-  }
-
-  Future<String> _getFramesDirectory() async {
-    final dir = await getTemporaryDirectory();
-    final framesDir = Directory('${dir.path}/waveform_frames');
-    if (!await framesDir.exists()) {
-      await framesDir.create(recursive: true);
-    }
-    return framesDir.path;
-  }
-
-  Future<void> _startRecording() async {
-    if (_isPlaying) {
-      await _playerController.pausePlayer();
-      setState(() => _isPlaying = false);
-    }
-    await _clearFramesDirectory();
-
-    // Check microphone permission first
-    try {
-      final hasPermission = await _mic.hasPermission();
-      if (!hasPermission) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Microphone permission is required to record audio'),
-              backgroundColor: Colors.red,
-            ),
-          );
-        }
-        return;
-      }
-    } catch (e) {
-      debugPrint('Permission check failed: $e');
-    }
-
-    final path = await _getFilePath();
-    try {
-      // Use simpler, more compatible recording settings
-      await _mic.start(
-        const RecordConfig(
-          encoder: AudioEncoder.aacLc,
-          sampleRate: 44100,
-          bitRate: 128000,
-          numChannels: 1, // Force mono to avoid channel mask issues
-        ),
-        path: path,
-      );
-
-      debugPrint('Recording started successfully to: $path');
-
-      setState(() {
-        _isRecording = true;
-        _filePath = path;
-        _capturedFrames.clear();
-        _frameCount = 0;
-        _smoothedAmp = 0.0;
-        _amp.value = 0.0;
-        _ampHistory.clear();
-        _playbackAmps.value = [];
-        _recordStart = DateTime.now();
-        _recordElapsed = Duration.zero;
-      });
-
-      // Start recording timer
-      _recordTimer?.cancel();
-      _recordTimer = Timer.periodic(const Duration(milliseconds: 200), (_) {
-        if (!_isRecording || _recordStart == null) return;
-        final now = DateTime.now();
-        if (mounted) {
-          setState(() {
-            _recordElapsed = now.difference(_recordStart!);
-          });
-        }
-      });
-
-      // Start amplitude monitoring
-      _ampTimer?.cancel();
-      _ampTimer = Timer.periodic(const Duration(milliseconds: kAmpSampleMs), (_) async {
-        try {
-          if (await _mic.isRecording()) {
-            final amplitude = await _mic.getAmplitude();
-            final db = amplitude.current;
-            final minDb = kNoiseFloorDb;
-            double target = db <= minDb ? 0.0 : ((db - minDb) / (0.0 - minDb)).clamp(0.0, 1.0);
-
-            // Smooth the amplitude
-            if (target > _smoothedAmp) {
-              _smoothedAmp += kAmpAttack * (target - _smoothedAmp);
-            } else {
-              _smoothedAmp += kAmpRelease * (target - _smoothedAmp);
-            }
-
-            double mapped = math.pow(_smoothedAmp.clamp(0.0, 1.0), kAmpGamma).toDouble();
-            final clamped = mapped.clamp(0.0, 1.0);
-            _ampHistory.add(clamped);
-            _amp.value = clamped;
-          }
-        } catch (e) {
-          debugPrint('Amplitude monitoring error: $e');
-        }
-      });
-
-      // Start frame capture
-      _startFrameCapture();
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Recording started'),
-            backgroundColor: Colors.green,
-          ),
-        );
-      }
-
-    } catch (e) {
-      debugPrint('Recording start failed: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to start recording: ${e.toString()}'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-
-      // Reset state if recording failed
-      setState(() {
-        _isRecording = false;
-        _filePath = null;
-      });
-    }
-  }
-
-  Future<void> _stopRecording() async {
-    if (!_isRecording) return;
-
-    try {
-      debugPrint('Stopping recording...');
-      final path = await _mic.stop();
-
-      // Stop all timers first
-      _stopFrameCapture();
-      _ampTimer?.cancel();
-      _recordTimer?.cancel();
-      _recordTimer = null;
-      _recordStart = null;
-
-      setState(() {
-        _isRecording = false;
-        _smoothedAmp = 0.0;
-        _amp.value = 0;
-      });
-
-      if (path != null && await File(path).exists()) {
-        debugPrint('Recording saved to: $path');
-        setState(() {
-          _filePath = path;
-          _videoPath = null;
-          _currentDuration = 0;
-        });
-
-        // Prepare player for playback
-        try {
-          await _playerController.stopPlayer();
-          await Future.delayed(const Duration(milliseconds: 200));
-
-          if (mounted) {
-            await _playerController.preparePlayer(
-              path: path,
-              noOfSamples: 1200,
-              shouldExtractWaveform: true,
-            );
-            _scrollController.jumpTo(0);
-          }
-
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Recording saved successfully'),
-                backgroundColor: Colors.green,
-              ),
-            );
-          }
-        } catch (e) {
-          debugPrint('Error preparing player: $e');
-          // Recording is still saved, just can't prepare player
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Recording saved, but playback preparation failed'),
-                backgroundColor: Colors.orange,
-              ),
-            );
-          }
-        }
-      } else {
-        debugPrint('Recording file not found or invalid path: $path');
-        setState(() {
-          _filePath = null;
-        });
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Recording failed - no file created'),
-              backgroundColor: Colors.red,
-            ),
-          );
-        }
-      }
-    } catch (e) {
-      debugPrint('Error stopping recording: $e');
-
-      // Clean up state anyway
-      _stopFrameCapture();
-      _ampTimer?.cancel();
-      _recordTimer?.cancel();
-      _recordTimer = null;
-      _recordStart = null;
-
-      setState(() {
-        _isRecording = false;
-        _smoothedAmp = 0.0;
-        _amp.value = 0;
-        _filePath = null;
-      });
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to stop recording: ${e.toString()}'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
-  }
 
   String _formatDuration(Duration d) {
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
@@ -814,455 +374,174 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
     return '$m:$s';
   }
 
-  void _startFrameCapture() {
-    // Reduced to ~15 FPS for much faster processing (was 30 FPS)
-    const frameDuration = Duration(milliseconds: 66); // 15 FPS instead of 30
-    _frameCaptureTimer = Timer.periodic(frameDuration, (timer) {
-      _captureWaveformFrame();
-    });
-  }
-
-  void _stopFrameCapture() {
-    _frameCaptureTimer?.cancel();
-    _frameCaptureTimer = null;
-  }
-
-  Future<void> _captureWaveformFrame() async {
-    if (!_isRecording || _captureBusy) return;
-    _captureBusy = true;
-    try {
-      final boundary = _waveformKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
-      if (boundary == null) return;
-      await WidgetsBinding.instance.endOfFrame;
-
-      // Reduced resolution for much faster processing - target 480px width
-      final logicalSize = (boundary.size);
-      double pixelRatio = 0.8; // Reduced from 1.0-1.6 for speed
-      if (logicalSize.width > 0 && logicalSize.height > 0) {
-        final scaleW = 480.0 / logicalSize.width; // Reduced from 720px
-        pixelRatio = scaleW.clamp(0.5, 1.0); // Lower quality for speed
-      }
-
-      final image = await boundary.toImage(pixelRatio: pixelRatio);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-      image.dispose();
-      if (byteData == null) return;
-
-      final buffer = byteData.buffer.asUint8List();
-      final framesDir = await _getFramesDirectory();
-      final framePath = '$framesDir/frame_${DateTime.now().millisecondsSinceEpoch}_$_frameCount.png';
-
-      // Direct file write instead of compute() for small files - faster
-      final file = File(framePath);
-      await file.writeAsBytes(buffer, flush: false);
-
-      setState(() {
-        _capturedFrames.add(framePath);
-        _frameCount++;
-      });
-    } catch (e) {
-      debugPrint('Error capturing waveform frame: $e');
-    } finally {
-      _captureBusy = false;
-    }
-  }
-
-  Future<void> _clearFramesDirectory() async {
-    try {
-      final framesDir = await _getFramesDirectory();
-      final dir = Directory(framesDir);
-      if (await dir.exists()) {
-        await for (final file in dir.list()) {
-          if (file is File && file.path.endsWith('.png')) {
-            await file.delete();
-          }
-        }
-      }
-    } catch (e) {
-      debugPrint('Error clearing frames directory: $e');
-    }
-  }
-
-  Future<void> _playRecording() async {
-    if (_filePath == null || !(await File(_filePath!).exists())) return;
-
-    try {
-      if (_isPlaying) {
-        await _playerController.pausePlayer();
-        setState(() => _isPlaying = false);
-      } else {
-        if (_currentDuration >= _playerController.maxDuration) {
-          await _playerController.seekTo(0);
-          _scrollController.jumpTo(0);
-        }
-        await _playerController.startPlayer();
-        setState(() => _isPlaying = true);
-      }
-    } catch (e) {
-      debugPrint('Error playing recording: $e');
-      setState(() => _isPlaying = false);
-    }
-  }
-
-  Future<void> _generateWaveformVideo() async {
-    if (_filePath == null || _capturedFrames.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please record audio first')),
-      );
-      return;
-    }
-
-    setState(() {
-      _isGeneratingVideo = true;
-    });
-
-    try {
-      final videoPath = await _getVideoPath();
-      final framesDir = await _getFramesDirectory();
-
-      // Get audio duration
-      final audioFile = File(_filePath!);
-      if (!await audioFile.exists()) {
-        throw Exception('Audio file not found');
-      }
-
-      // Calculate actual frame rate based on captured frames and audio duration
-      await _audioPlayer.setFilePath(_filePath!);
-      final durMs = _audioPlayer.duration?.inMilliseconds ?? 0;
-      final audioSeconds = durMs / 1000.0;
-
-      if (audioSeconds <= 0) {
-        throw Exception('Invalid audio duration');
-      }
-
-      // Calculate the actual frame rate we captured at
-      final actualCaptureRate = _capturedFrames.length / audioSeconds;
-      debugPrint('Audio duration: ${audioSeconds.toStringAsFixed(2)}s');
-      debugPrint('Captured frames: ${_capturedFrames.length}');
-      debugPrint('Actual capture rate: ${actualCaptureRate.toStringAsFixed(2)} fps');
-
-      // Use a consistent output frame rate
-      const double outputFps = 15.0;
-
-      // Calculate how many frames we need for smooth video
-      final neededFrames = (audioSeconds * outputFps).round();
-      debugPrint('Needed frames for ${outputFps}fps: $neededFrames');
-
-      // Prepare frame pattern for FFmpeg
-      final framePattern = '$framesDir/frame_%05d.png';
-
-      // Rename frames to match the expected pattern
-      await _renameFramesSequentially();
-
-      // Check actual frames after renaming
-      final renamedFramesDir = Directory(framesDir);
-      final renamedFrames = await renamedFramesDir
-          .list()
-          .where((file) => file.path.contains('frame_') && file.path.endsWith('.png'))
-          .length;
-
-      debugPrint('Frames available after renaming: $renamedFrames');
-
-      // Calculate input frame rate that will make video match audio duration
-      // This ensures the video duration equals audio duration
-      final inputFrameRate = renamedFrames / audioSeconds;
-      final clampedInputRate = inputFrameRate.clamp(10.0, 30.0);
-
-      debugPrint('Calculated input frame rate: ${inputFrameRate.toStringAsFixed(2)} fps');
-      debugPrint('Using clamped input rate: ${clampedInputRate.toStringAsFixed(2)} fps');
-
-      // Video filter with consistent output frame rate
-      final vf = 'fps=$outputFps,scale=360:640:force_original_aspect_ratio=decrease,pad=360:640:(ow-iw)/2:(oh-ih)/2:color=0x01004E';
-
-      final command = [
-        '-y', // Overwrite output file
-        '-framerate', clampedInputRate.toStringAsFixed(2), // Input sequence framerate
-        '-i', framePattern, // Input frames pattern
-        '-i', _filePath!, // Input audio
-        '-map', '0:v:0', // Video stream
-        '-map', '1:a:0', // Audio stream
-        '-vf', vf, // Video filters
-        '-c:v', 'libx264', // Video codec
-        '-preset', 'ultrafast', // Fastest encoding
-        '-tune', 'zerolatency', // Optimize for speed
-        '-crf', '28', // Better quality than 36
-        '-pix_fmt', 'yuv420p', // Compatibility
-        '-c:a', 'aac', // Audio codec
-        '-ac', '1', // Mono audio
-        '-b:a', '64k', // Audio bitrate
-        '-avoid_negative_ts', 'make_zero', // Handle timing issues
-        '-fflags', '+genpts', // Generate presentation timestamps
-        // Remove -shortest to let audio determine duration
-        '-movflags', '+faststart', // Web playback
-        '-threads', '0', // Use all CPU cores
-        videoPath
-      ].join(' ');
-
-      debugPrint('FFmpeg command: $command');
-
-      final session = await FFmpegKit.execute(command);
-      final returnCode = await session.getReturnCode();
-      final logs = await session.getLogsAsString();
-
-      debugPrint('FFmpeg logs: $logs');
-
-      if (ReturnCode.isSuccess(returnCode)) {
-        setState(() {
-          _videoPath = videoPath;
-        });
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Waveform video generated successfully!'),
-              backgroundColor: Colors.green,
-            ),
-          );
-        }
-      } else {
-        debugPrint('FFmpeg failed with return code: $returnCode');
-        throw Exception('FFmpeg failed with return code: $returnCode');
-      }
-    } catch (e) {
-      debugPrint('Error generating video: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isGeneratingVideo = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _renameFramesSequentially() async {
-    try {
-      final framesDir = await _getFramesDirectory();
-
-      // Sort frames by creation time to maintain order
-      _capturedFrames.sort();
-
-      debugPrint('Renaming ${_capturedFrames.length} frames sequentially...');
-
-      for (var i = 0; i < _capturedFrames.length; i++) {
-        final oldFile = File(_capturedFrames[i]);
-        final newPath = '$framesDir/frame_${(i + 1).toString().padLeft(5, '0')}.png';
-
-        if (await oldFile.exists()) {
-          await oldFile.copy(newPath);
-          debugPrint('Renamed frame ${i + 1}: ${oldFile.path} -> $newPath');
-        } else {
-          debugPrint('Warning: Frame file not found: ${oldFile.path}');
-        }
-      }
-
-      debugPrint('Frame renaming completed successfully');
-    } catch (e) {
-      debugPrint('Error renaming frames: $e');
-      rethrow;
-    }
-  }
-
-  Future<void> _shareWaveformVideo() async {
-    if (_videoPath == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please generate a video first')),
-      );
-      return;
-    }
-
-    await Share.shareXFiles(
-      [XFile(_videoPath!)],
-      text: 'Check out my audio waveform visualization!',
-      subject: 'Waveform Video',
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Color(0xFF01004E),
+      backgroundColor: const Color(0xFF01004E),
       appBar: AppBar(
         title: const Text('Custom Voice Recorder'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       ),
-      body: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          // Recording status
-          if (_isRecording)
-            Container(
-              padding: const EdgeInsets.all(16),
-              margin: const EdgeInsets.all(16),
-              // decoration: BoxDecoration(
-              //   color: const Color(0x1AFF0000),
-              //   borderRadius: BorderRadius.circular(8),
-              //   border: Border.all(color: const Color(0x4DFF0000)),
-              // ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Container(
-                    width: 12,
-                    height: 12,
-                    decoration: const BoxDecoration(
-                      color: Colors.red,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  const Text(
-                    'Recording...',
-                    style: TextStyle(
-                      color: Colors.red,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Text(
-                    _formatDuration(_recordElapsed),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Text(
-                    'Frames: ${_capturedFrames.length}',
-                    style: const TextStyle(
-                      color: Color(0xB3FF0000),
-                      fontSize: 12,
-                    ),
-                  ),
-                ],
-              ),
-            ),
+      body: Obx(() {
+        final isRecording = controller.isRecording.value;
+        final isPlaying = controller.isPlaying.value;
+        final frames = controller.framesCount.value;
+        final elapsed = controller.recordElapsed.value;
+        final isGenerating = controller.isGeneratingVideo.value;
 
-          // Optional timer above even when status hidden (only show while recording)
-          if (_isRecording)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(
-                'Time ${_formatDuration(_recordElapsed)}',
-                style: const TextStyle(color: Colors.white70, fontSize: 14),
+        return Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (isRecording)
+              Container(
+                padding: const EdgeInsets.all(16),
+                margin: const EdgeInsets.all(16),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Container(
+                      width: 12,
+                      height: 12,
+                      decoration: const BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    const Text(
+                      'Recording...',
+                      style: TextStyle(
+                        color: Colors.red,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Text(
+                      _formatDuration(elapsed),
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Text(
+                      'Frames: $frames',
+                      style: const TextStyle(
+                        color: Color(0xB3FF0000),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            ),
 
-          Expanded(
-            child: Center(
-              child: RepaintBoundary(
-                key: _waveformKey,
-                child: Builder(
-                  builder: (ctx) {
-                    final screen = MediaQuery.of(ctx).size;
-                    // Make the waves widget cover 30% of the screen vertically and full width
-                    final double targetW = screen.width;
-                    final double targetH = screen.height * 0.30;
-                    return SizedBox(
-                      width: targetW,
-                      height: targetH,
-                      child: CustomWaveformWidget(
-                        recorderController: null,
-                        playerController: _playerController,
-                        isRecording: _isRecording,
-                        isPlaying: _isPlaying,
-                        currentDuration: _currentDuration,
+            if (isRecording)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 8),
+                child: Text(
+                  'Time ',
+                  style: TextStyle(color: Colors.white70, fontSize: 14),
+                ),
+              ),
+            if (isRecording)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  _formatDuration(elapsed),
+                  style: const TextStyle(color: Colors.white70, fontSize: 14),
+                ),
+              ),
+
+            Expanded(
+              child: Center(
+                child: RepaintBoundary(
+                  key: controller.waveformKey,
+                  child: Builder(
+                    builder: (ctx) {
+                      final screen = MediaQuery.of(ctx).size;
+                      final double targetW = screen.width;
+                      final double targetH = screen.height * 0.30;
+                      return SizedBox(
                         width: targetW,
                         height: targetH,
-                        logoAssetPath: kLogoAsset,
-                        amplitude: _amp,
-                        backgroundColor: kWaveBgColor,
-                        logoTint: kLogoTintColor,
-                        maxVerticalLogos: kMaxVerticalLogos,
-                        horizontalGap: kHorizontalGap,
-                        verticalGap: kVerticalGap,
-                        amplitudeDensityDivisor: kAmplitudeDensityDivisor,
-                        minLogoSize: kMinLogoSize, // NEW
-                        playbackAmps: _isPlaying ? _playbackAmps : null, // NEW
-                      ),
-                    );
-                  },
+                        child: CustomWaveformWidget(
+                          width: targetW,
+                          height: targetH,
+                        ),
+                      );
+                    },
+                  ),
                 ),
               ),
             ),
-          ),
 
-          const SizedBox(height: 20),
+            const SizedBox(height: 20),
 
-          // Control buttons
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              FloatingActionButton(
-                onPressed: _isRecording ? _stopRecording : _startRecording,
-                backgroundColor: _isRecording ? Colors.red : Colors.blue,
-                child: Icon(_isRecording ? Icons.stop : Icons.mic),
-              ),
-              if (_filePath != null && !_isRecording) ...[
-                const SizedBox(width: 20),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
                 FloatingActionButton(
-                  onPressed: _playRecording,
-                  backgroundColor: _isPlaying ? Colors.orange : Colors.green,
-                  child: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
+                  onPressed: isRecording ? controller.stopRecording : controller.startRecording,
+                  backgroundColor: isRecording ? Colors.red : Colors.blue,
+                  child: Icon(isRecording ? Icons.stop : Icons.mic),
                 ),
-                const SizedBox(width: 20),
-                FloatingActionButton(
-                  onPressed: _isGeneratingVideo ? null : _generateWaveformVideo,
-                  backgroundColor: _isGeneratingVideo ? Colors.grey : Colors.purple,
-                  child: _isGeneratingVideo
-                      ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                    ),
-                  )
-                      : const Icon(Icons.video_call),
-                ),
-                const SizedBox(width: 20),
-                FloatingActionButton(
-                  onPressed: _videoPath != null ? _shareWaveformVideo : null,
-                  backgroundColor: _videoPath != null ? Colors.indigo : Colors.grey,
-                  child: const Icon(Icons.share),
-                ),
+                if (controller.filePath != null && !isRecording) ...[
+                  const SizedBox(width: 20),
+                  FloatingActionButton(
+                    onPressed: controller.playRecording,
+                    backgroundColor: isPlaying ? Colors.orange : Colors.green,
+                    child: Icon(isPlaying ? Icons.pause : Icons.play_arrow),
+                  ),
+                  const SizedBox(width: 20),
+                  FloatingActionButton(
+                    onPressed: isGenerating ? null : controller.generateWaveformVideo,
+                    backgroundColor: isGenerating ? Colors.grey : Colors.purple,
+                    child: isGenerating
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                            ),
+                          )
+                        : const Icon(Icons.video_call),
+                  ),
+                  const SizedBox(width: 20),
+                  FloatingActionButton(
+                    onPressed: controller.videoPath != null ? controller.shareWaveformVideo : null,
+                    backgroundColor: controller.videoPath != null ? Colors.indigo : Colors.grey,
+                    child: const Icon(Icons.share),
+                  ),
+                ],
               ],
-            ],
-          ),
-
-          const SizedBox(height: 20),
-
-          // Status information
-          if (_capturedFrames.isNotEmpty && !_isRecording)
-            Container(
-              padding: const EdgeInsets.all(12),
-              margin: const EdgeInsets.symmetric(horizontal: 16),
-              decoration: BoxDecoration(
-                color: const Color(0x1A2196F3),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: const Color(0x4D2196F3)),
-              ),
-              child: Text(
-                'Captured ${_capturedFrames.length} (${(_capturedFrames.length/30).toInt()}) frames for video generation',
-                style: TextStyle(
-                  color: Colors.blue.shade700,
-                  fontSize: 12,
-                ),
-                textAlign: TextAlign.center,
-              ),
             ),
 
-          const SizedBox(height: 40),
-        ],
-      ),
+            const SizedBox(height: 20),
+
+            if (frames > 0 && !isRecording)
+              Container(
+                padding: const EdgeInsets.all(12),
+                margin: const EdgeInsets.symmetric(horizontal: 16),
+                decoration: BoxDecoration(
+                  color: const Color(0x1A2196F3),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0x4D2196F3)),
+                ),
+                child: Text(
+                  'Captured $frames (${(frames/30).toInt()}) frames for video generation',
+                  style: TextStyle(
+                    color: Colors.blue.shade700,
+                    fontSize: 12,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+
+            const SizedBox(height: 40),
+          ],
+        );
+      }),
     );
   }
 }
-
