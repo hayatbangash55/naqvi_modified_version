@@ -700,8 +700,8 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   }
 
   void _startFrameCapture() {
-    // Target ~30 FPS for smoother video
-    const frameDuration = Duration(milliseconds: 33);
+    // Reduced to ~15 FPS for much faster processing (was 30 FPS)
+    const frameDuration = Duration(milliseconds: 66); // 15 FPS instead of 30
     _frameCaptureTimer = Timer.periodic(frameDuration, (timer) {
       _captureWaveformFrame();
     });
@@ -720,15 +720,15 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       if (boundary == null) return;
       await WidgetsBinding.instance.endOfFrame;
 
-      // Compute pixelRatio to target ~720px width to reduce IO and dropped frames
+      // Reduced resolution for much faster processing - target 480px width
       final logicalSize = (boundary.size);
-      double pixelRatio = 1.0;
+      double pixelRatio = 0.8; // Reduced from 1.0-1.6 for speed
       if (logicalSize.width > 0 && logicalSize.height > 0) {
-        final scaleW = 720.0 / logicalSize.width;
-        pixelRatio = scaleW;
+        final scaleW = 480.0 / logicalSize.width; // Reduced from 720px
+        pixelRatio = scaleW.clamp(0.5, 1.0); // Lower quality for speed
       }
 
-      final image = await boundary.toImage(pixelRatio: pixelRatio.clamp(1.0, 1.6));
+      final image = await boundary.toImage(pixelRatio: pixelRatio);
       final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
       image.dispose();
       if (byteData == null) return;
@@ -737,8 +737,9 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       final framesDir = await _getFramesDirectory();
       final framePath = '$framesDir/frame_${DateTime.now().millisecondsSinceEpoch}_$_frameCount.png';
 
-      // Offload disk write to a background isolate using compute()
-      await compute(_writePngToFile, _FileWritePayload(framePath, buffer));
+      // Direct file write instead of compute() for small files - faster
+      final file = File(framePath);
+      await file.writeAsBytes(buffer, flush: false);
 
       setState(() {
         _capturedFrames.add(framePath);
@@ -817,12 +818,12 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       if (durMs > 0) {
         calculatedFPS = ((_capturedFrames.length * 1000) / durMs).round();
       } else {
-        calculatedFPS = _targetFPS;
+        calculatedFPS = 15; // Match our reduced capture rate
       }
 
       // Input framerate (as captured), clamp to a sane range
-      final inFps = calculatedFPS.clamp(1, 60);
-      const int outFps = 30; // Force smooth 30 FPS output
+      final inFps = calculatedFPS.clamp(10, 20); // Lower range for speed
+      const int outFps = 24; // Reduced output FPS for speed (was 30)
 
       debugPrint(
           'Audio duration: ${(durMs / 1000).toStringAsFixed(2)}s, Frames: ${_capturedFrames.length}, In FPS: $inFps, Out FPS: $outFps');
@@ -833,22 +834,30 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       // Rename frames to match the expected pattern
       await _renameFramesSequentially();
 
-      // Create video: ingest at measured rate, output constant 30fps for smoother playback
-      final vf = 'fps=$outFps,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x01004E';
+      // Ultra-fast video generation optimized for speed over quality
+      final vf = 'fps=$outFps,scale=480:854:force_original_aspect_ratio=decrease,pad=480:854:(ow-iw)/2:(oh-ih)/2:color=0x01004E';
+
       final command = [
         '-y', // Overwrite output file
         '-framerate', '$inFps', // Input sequence framerate (as captured)
         '-i', framePattern, // Input frames pattern
         '-i', _filePath!, // Input audio
-        '-vf', vf, // Constant output fps + scale/pad
+        '-vf', vf, // Much smaller resolution (480x854 instead of 1080x1920)
         '-c:v', 'libx264', // Video codec
-        '-preset', 'medium', // Encoding preset
-        '-crf', '23', // Quality (lower = better quality)
+        '-preset', 'ultrafast', // Absolute fastest encoding
+        '-crf', '35', // Much lower quality for speed (was 23)
+        '-tune', 'zerolatency', // Optimize for speed
         '-c:a', 'aac', // Audio codec
-        '-b:a', '128k', // Audio bitrate
+        '-b:a', '64k', // Very low audio bitrate for speed (was 128k)
         '-pix_fmt', 'yuv420p', // Pixel format for compatibility
         '-shortest', // Match shortest stream duration
         '-movflags', '+faststart', // Optimize for web playback
+        '-threads', '0', // Use all CPU cores
+        '-bf', '0', // No B-frames for faster encoding
+        '-g', '30', // Keyframe interval for speed
+        '-sc_threshold', '0', // Disable scene change detection
+        '-maxrate', '2M', // Low bitrate limit
+        '-bufsize', '4M', // Small buffer size
         videoPath
       ].join(' ');
 
