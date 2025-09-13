@@ -41,6 +41,9 @@ class CustomWaveformWidget extends StatefulWidget {
   // NEW: controls number of columns in amplitude buffer
   final double amplitudeDensityDivisor;
 
+  // NEW: enforce visible logo size
+  final double minLogoSize;
+
   const CustomWaveformWidget({
     super.key,
     this.recorderController,
@@ -58,6 +61,7 @@ class CustomWaveformWidget extends StatefulWidget {
     this.horizontalGap = 10.0,
     this.verticalGap = 6.0,
     this.amplitudeDensityDivisor = 12.0,
+    this.minLogoSize = 16.0, // NEW default
   });
 
   @override
@@ -162,6 +166,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
             maxVerticalLogos: widget.maxVerticalLogos, // NEW
             horizontalGap: widget.horizontalGap, // NEW
             verticalGap: widget.verticalGap, // NEW
+            minLogoSize: widget.minLogoSize, // NEW
           ),
           size: Size(widget.width, widget.height),
         ),
@@ -183,6 +188,7 @@ class WaveformLogoPainter extends CustomPainter {
   final int maxVerticalLogos; // NEW
   final double horizontalGap; // NEW
   final double verticalGap; // NEW
+  final double minLogoSize; // NEW
 
   WaveformLogoPainter({
     required this.amplitudes,
@@ -196,6 +202,7 @@ class WaveformLogoPainter extends CustomPainter {
     this.maxVerticalLogos = 30,
     this.horizontalGap = 10.0,
     this.verticalGap = 6.0,
+    this.minLogoSize = 16.0, // NEW
   }) : super(repaint: animation);
 
   @override
@@ -218,9 +225,11 @@ class WaveformLogoPainter extends CustomPainter {
       return;
     }
 
-    // Use configurable geometry
-    final double logoHeight = ((size.height - (maxVerticalLogos - 1) * verticalGap) / maxVerticalLogos)
-        .clamp(2.0, size.height);
+    // Compute an effective number of rows so each logo is at least minLogoSize tall
+    final int maxRowsFitByHeight = ((size.height + verticalGap) / (minLogoSize + verticalGap)).floor().clamp(1, maxVerticalLogos);
+    final int rows = maxRowsFitByHeight; // dynamic rows ensures no tiny dots
+
+    final double logoHeight = ((size.height - (rows - 1) * verticalGap) / rows).clamp(minLogoSize, size.height);
     final double logoWidth = logoHeight;
     final double perCol = logoWidth + horizontalGap;
     final int columnCount = perCol > 0 ? ((size.width + horizontalGap) / perCol).floor() : 0;
@@ -246,7 +255,7 @@ class WaveformLogoPainter extends CustomPainter {
       // Map amplitude 0..1 to 1..maxVerticalLogos (ceil)
       final int logoCount = amplitude <= 0
           ? 1
-          : (amplitude * maxVerticalLogos).ceil().clamp(1, maxVerticalLogos);
+          : (amplitude * rows).ceil().clamp(1, rows);
 
       // Compute vertical stack positioning
       final double totalStackHeight = logoCount * logoHeight + (logoCount - 1) * verticalGap;
@@ -316,20 +325,21 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   static const String kLogoAsset = 'assets/images/logo.png'; // NEW: logo asset path
 
   // NEW: amplitude smoothing constants (tweak to change rigidity)
-  static const double kNoiseFloorDb = -38.0; // higher gate -> less sensitivity to low noise
-  static const double kAmpAttack = 0.25;     // slower rise -> feels more rigid
-  static const double kAmpRelease = 0.06;    // slower fall -> avoids jitter
-  static const double kAmpGamma = 2.0;       // stronger curve -> de-emphasize small signals
-  static const int kAmpQuantSteps = 24;      // 0 to disable; higher -> finer steps
+  static const double kNoiseFloorDb = -34.0; // higher gate -> less sensitivity
+  static const double kAmpAttack = 0.18;     // slower rise
+  static const double kAmpRelease = 0.05;    // slower fall
+  static const double kAmpGamma = 2.4;       // stronger curve
+  static const int kAmpQuantSteps = 16;      // coarser quantization
 
   // NEW: smoothed amplitude state
   double _smoothedAmp = 0.0;
 
   // NEW: spacing/size controls for the wave grid
-  static const int kMaxVerticalLogos = 22; // fewer rows -> larger logo size
-  static const double kHorizontalGap = 16.0; // slightly more distance between waves
-  static const double kVerticalGap = 10.0; // slightly more distance vertically
+  static const int kMaxVerticalLogos = 20; // slight size decrease vs 18
+  static const double kHorizontalGap = 16.0; // keep spacing
+  static const double kVerticalGap = 10.0; // keep spacing
   static const double kAmplitudeDensityDivisor = 16.0; // columns count (unchanged)
+  static const double kMinLogoSize = 22.0; // slightly smaller vs 24.0
 
   // NEW: stopwatch-like timer for recording duration
   Timer? _recordTimer;
@@ -873,15 +883,9 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
                 child: Builder(
                   builder: (ctx) {
                     final screen = MediaQuery.of(ctx).size;
-                    // Enforce 9:16 box
-                    final maxW = screen.width;
-                    final maxH = screen.height * 0.9;
-                    double targetW = maxW;
-                    double targetH = targetW * 16.0 / 9.0;
-                    if (targetH > maxH) {
-                      targetH = maxH;
-                      targetW = targetH * 9.0 / 16.0;
-                    }
+                    // Make the waves widget cover 30% of the screen vertically and full width
+                    final double targetW = screen.width;
+                    final double targetH = screen.height * 0.30;
                     return SizedBox(
                       width: targetW,
                       height: targetH,
@@ -901,6 +905,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
                         horizontalGap: kHorizontalGap,
                         verticalGap: kVerticalGap,
                         amplitudeDensityDivisor: kAmplitudeDensityDivisor,
+                        minLogoSize: kMinLogoSize, // NEW
                       ),
                     );
                   },
