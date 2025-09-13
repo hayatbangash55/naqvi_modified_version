@@ -164,7 +164,8 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
           final start = src.length > patternCount ? src.length - patternCount : 0;
           tail = src.sublist(start);
           if (tail.length < patternCount) {
-            tail = List.filled(patternCount - tail.length, 0.0)..addAll(tail);
+            final padCount = patternCount - tail.length;
+            tail = List<double>.filled(padCount, 0.0, growable: true)..addAll(tail);
           }
         }
         // Normalize current amplitudes to patternCount for a stable lerp base
@@ -684,8 +685,8 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   }
 
   void _startFrameCapture() {
-    // Throttle to ~15 FPS to reduce main-thread load
-    const frameDuration = Duration(milliseconds: 66);
+    // Target ~30 FPS for smoother video
+    const frameDuration = Duration(milliseconds: 33);
     _frameCaptureTimer = Timer.periodic(frameDuration, (timer) {
       _captureWaveformFrame();
     });
@@ -704,16 +705,16 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       if (boundary == null) return;
       await WidgetsBinding.instance.endOfFrame;
 
-      // Compute pixelRatio to get ~1080x1920 output based on current logical size
+      // Compute pixelRatio to get a high-quality but performant output
       final logicalSize = (boundary.size);
       double pixelRatio = 1.0;
       if (logicalSize.width > 0 && logicalSize.height > 0) {
         final scaleW = 1080.0 / logicalSize.width;
-        // If aspect ratio is enforced to 9:16, scaleW ~ scaleH; choose scaleW for exact 1080 width
+        // Cap to reduce capture load and avoid dropped frames
         pixelRatio = scaleW;
       }
 
-      final image = await boundary.toImage(pixelRatio: pixelRatio.clamp(1.0, 4.0));
+      final image = await boundary.toImage(pixelRatio: pixelRatio.clamp(1.0, 2.0));
       final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
       image.dispose();
       if (byteData == null) return;
@@ -805,11 +806,12 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         calculatedFPS = _targetFPS;
       }
 
-      // Ensure minimum frame rate of 1 and maximum of 60 for practical video generation
-      final actualFPS = calculatedFPS.clamp(1, 60);
+      // Input framerate (as captured), clamp to a sane range
+      final inFps = calculatedFPS.clamp(1, 60);
+      const int outFps = 30; // Force smooth 30 FPS output
 
       debugPrint(
-          'Audio duration: ${(durMs / 1000).toStringAsFixed(2)}s, Frames: ${_capturedFrames.length}, Calculated FPS: $calculatedFPS, Using FPS: $actualFPS');
+          'Audio duration: ${(durMs / 1000).toStringAsFixed(2)}s, Frames: ${_capturedFrames.length}, In FPS: $inFps, Out FPS: $outFps');
 
       // Prepare frame pattern for FFmpeg
       final framePattern = '$framesDir/frame_%05d.png';
@@ -817,13 +819,14 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       // Rename frames to match the expected pattern
       await _renameFramesSequentially();
 
-      // Create video with calculated frame rate to match audio duration exactly
+      // Create video: ingest at measured rate, output constant 30fps for smoother playback
+      final vf = 'fps=$outFps,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x01004E';
       final command = [
         '-y', // Overwrite output file
-        '-r', '$actualFPS', // Use calculated frame rate
+        '-framerate', '$inFps', // Input sequence framerate (as captured)
         '-i', framePattern, // Input frames pattern
         '-i', _filePath!, // Input audio
-        '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x01004E', // Ensure even dimensions
+        '-vf', vf, // Constant output fps + scale/pad
         '-c:v', 'libx264', // Video codec
         '-preset', 'medium', // Encoding preset
         '-crf', '23', // Quality (lower = better quality)
