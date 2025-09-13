@@ -587,41 +587,65 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
     }
     await _clearFramesDirectory();
 
+    // Check microphone permission first
+    try {
+      final hasPermission = await _mic.hasPermission();
+      if (!hasPermission) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Microphone permission is required to record audio'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+        return;
+      }
+    } catch (e) {
+      debugPrint('Permission check failed: $e');
+    }
+
     final path = await _getFilePath();
     try {
-      // Start mic recording with high quality
+      // Use simpler, more compatible recording settings
       await _mic.start(
         const RecordConfig(
           encoder: AudioEncoder.aacLc,
-          sampleRate: 48000,
+          sampleRate: 44100,
           bitRate: 128000,
+          numChannels: 1, // Force mono to avoid channel mask issues
         ),
         path: path,
       );
+
+      debugPrint('Recording started successfully to: $path');
+
       setState(() {
         _isRecording = true;
         _filePath = path;
         _capturedFrames.clear();
         _frameCount = 0;
-        _smoothedAmp = 0.0; // reset smoothing at start
+        _smoothedAmp = 0.0;
         _amp.value = 0.0;
-        _ampHistory.clear(); // NEW reset history
-        _playbackAmps.value = []; // NEW reset playback window
-        // start stopwatch
+        _ampHistory.clear();
+        _playbackAmps.value = [];
         _recordStart = DateTime.now();
         _recordElapsed = Duration.zero;
       });
 
+      // Start recording timer
       _recordTimer?.cancel();
       _recordTimer = Timer.periodic(const Duration(milliseconds: 200), (_) {
         if (!_isRecording || _recordStart == null) return;
         final now = DateTime.now();
-        setState(() {
-          _recordElapsed = now.difference(_recordStart!);
-        });
+        if (mounted) {
+          setState(() {
+            _recordElapsed = now.difference(_recordStart!);
+          });
+        }
       });
 
-      // Start amplitude polling
+      // Start amplitude monitoring
       _ampTimer?.cancel();
       _ampTimer = Timer.periodic(const Duration(milliseconds: kAmpSampleMs), (_) async {
         try {
@@ -630,64 +654,157 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
             final db = amplitude.current;
             final minDb = kNoiseFloorDb;
             double target = db <= minDb ? 0.0 : ((db - minDb) / (0.0 - minDb)).clamp(0.0, 1.0);
+
+            // Smooth the amplitude
             if (target > _smoothedAmp) {
               _smoothedAmp += kAmpAttack * (target - _smoothedAmp);
             } else {
               _smoothedAmp += kAmpRelease * (target - _smoothedAmp);
             }
+
             double mapped = math.pow(_smoothedAmp.clamp(0.0, 1.0), kAmpGamma).toDouble();
-            if (kAmpQuantSteps > 0) {
-              mapped = (mapped * kAmpQuantSteps).round() / kAmpQuantSteps;
-            }
             final clamped = mapped.clamp(0.0, 1.0);
-            _ampHistory.add(clamped); // NEW collect history
+            _ampHistory.add(clamped);
             _amp.value = clamped;
           }
-        } catch (_) {}
+        } catch (e) {
+          debugPrint('Amplitude monitoring error: $e');
+        }
       });
 
-      // Start frame capture at throttled FPS
+      // Start frame capture
       _startFrameCapture();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Recording started'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+
     } catch (e) {
-      debugPrint('Error recording: $e');
+      debugPrint('Recording start failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to start recording: ${e.toString()}'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+
+      // Reset state if recording failed
+      setState(() {
+        _isRecording = false;
+        _filePath = null;
+      });
     }
   }
 
   Future<void> _stopRecording() async {
-    try {
-      final path = await _mic.stop();
-      setState(() {
-        _isRecording = false;
-        _filePath = path;
-        _videoPath = null;
-        _currentDuration = 0;
-      });
+    if (!_isRecording) return;
 
-      // Stop capture and amplitude polling
+    try {
+      debugPrint('Stopping recording...');
+      final path = await _mic.stop();
+
+      // Stop all timers first
       _stopFrameCapture();
       _ampTimer?.cancel();
-      _smoothedAmp = 0.0; // reset smoothing at stop
-      _amp.value = 0;
-
-      // stop stopwatch
       _recordTimer?.cancel();
       _recordTimer = null;
       _recordStart = null;
 
-      if (path != null) {
-        await _playerController.stopPlayer();
-        await Future.delayed(const Duration(milliseconds: 200));
+      setState(() {
+        _isRecording = false;
+        _smoothedAmp = 0.0;
+        _amp.value = 0;
+      });
+
+      if (path != null && await File(path).exists()) {
+        debugPrint('Recording saved to: $path');
+        setState(() {
+          _filePath = path;
+          _videoPath = null;
+          _currentDuration = 0;
+        });
+
+        // Prepare player for playback
+        try {
+          await _playerController.stopPlayer();
+          await Future.delayed(const Duration(milliseconds: 200));
+
+          if (mounted) {
+            await _playerController.preparePlayer(
+              path: path,
+              noOfSamples: 1200,
+              shouldExtractWaveform: true,
+            );
+            _scrollController.jumpTo(0);
+          }
+
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Recording saved successfully'),
+                backgroundColor: Colors.green,
+              ),
+            );
+          }
+        } catch (e) {
+          debugPrint('Error preparing player: $e');
+          // Recording is still saved, just can't prepare player
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Recording saved, but playback preparation failed'),
+                backgroundColor: Colors.orange,
+              ),
+            );
+          }
+        }
+      } else {
+        debugPrint('Recording file not found or invalid path: $path');
+        setState(() {
+          _filePath = null;
+        });
+
         if (mounted) {
-          await _playerController.preparePlayer(
-            path: path,
-            noOfSamples: 1200,
-            shouldExtractWaveform: true,
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Recording failed - no file created'),
+              backgroundColor: Colors.red,
+            ),
           );
-          _scrollController.jumpTo(0);
         }
       }
     } catch (e) {
       debugPrint('Error stopping recording: $e');
+
+      // Clean up state anyway
+      _stopFrameCapture();
+      _ampTimer?.cancel();
+      _recordTimer?.cancel();
+      _recordTimer = null;
+      _recordStart = null;
+
+      setState(() {
+        _isRecording = false;
+        _smoothedAmp = 0.0;
+        _amp.value = 0;
+        _filePath = null;
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to stop recording: ${e.toString()}'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
