@@ -155,7 +155,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
     if (srcListenable != null) {
       void listener() {
         if (!mounted) return;
-        final patternCount = (widget.width / widget.amplitudeDensityDivisor).ceil().clamp(1, 10000);
+        final patternCount = _computeColumnCount().clamp(1, 10000);
         final src = srcListenable.value; // use captured listenable, not widget.playbackAmps
         List<double> tail;
         if (src.isEmpty) {
@@ -186,7 +186,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   }
 
   void _initializeAmplitudes() {
-    final patternCount = (widget.width / widget.amplitudeDensityDivisor).ceil();
+    final patternCount = _computeColumnCount().clamp(1, 10000);
     _amplitudes
       ..clear()
       ..addAll(List.filled(patternCount, 0.05));
@@ -199,7 +199,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
     // Only run shifting timer during recording
     _amplitudeTimer?.cancel();
     if (widget.isRecording) {
-      _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
+      _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 33), (_) {
         if (!mounted) return;
         final live = widget.amplitude.value.clamp(0.0, 1.0);
         setState(() {
@@ -282,6 +282,21 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
         ),
       ),
     );
+  }
+
+  int _computeColumnCount() {
+    // Mirror WaveformLogoPainter layout to keep amplitudes length == drawn columns
+    final rows = (((widget.height + widget.verticalGap) /
+                (widget.minLogoSize + widget.verticalGap))
+            .floor())
+        .clamp(1, widget.maxVerticalLogos);
+    final logoHeight = ((widget.height - (rows - 1) * widget.verticalGap) / rows)
+        .clamp(widget.minLogoSize, widget.height);
+    final perCol = logoHeight + widget.horizontalGap;
+    final columnCount = perCol > 0
+        ? ((widget.width + widget.horizontalGap) / perCol).floor()
+        : 0;
+    return columnCount;
   }
 }
 
@@ -436,10 +451,10 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
 
   // NEW: amplitude smoothing constants (tweak to change rigidity)
   static const double kNoiseFloorDb = -34.0; // higher gate -> less sensitivity
-  static const double kAmpAttack = 0.18;     // slower rise
-  static const double kAmpRelease = 0.05;    // slower fall
-  static const double kAmpGamma = 2.4;       // stronger curve
-  static const int kAmpQuantSteps = 16;      // coarser quantization
+  static const double kAmpAttack = 0.30;     // faster rise for responsiveness
+  static const double kAmpRelease = 0.12;    // faster fall
+  static const double kAmpGamma = 2.0;       // slightly less aggressive curve
+  static const int kAmpQuantSteps = 0;       // disable quantization for smooth video
 
   // NEW: smoothed amplitude state
   double _smoothedAmp = 0.0;
@@ -458,7 +473,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
 
   // History of recorded amplitudes sampled every kAmpSampleMs during recording
   final List<double> _ampHistory = []; // NEW
-  static const int kAmpSampleMs = 50; // NEW: matches _ampTimer period
+  static const int kAmpSampleMs = 33; // NEW: 30Hz to match capture FPS
   final ValueNotifier<List<double>> _playbackAmps = ValueNotifier<List<double>>([]); // NEW
 
   @override
@@ -705,16 +720,15 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       if (boundary == null) return;
       await WidgetsBinding.instance.endOfFrame;
 
-      // Compute pixelRatio to get a high-quality but performant output
+      // Compute pixelRatio to target ~720px width to reduce IO and dropped frames
       final logicalSize = (boundary.size);
       double pixelRatio = 1.0;
       if (logicalSize.width > 0 && logicalSize.height > 0) {
-        final scaleW = 1080.0 / logicalSize.width;
-        // Cap to reduce capture load and avoid dropped frames
+        final scaleW = 720.0 / logicalSize.width;
         pixelRatio = scaleW;
       }
 
-      final image = await boundary.toImage(pixelRatio: pixelRatio.clamp(1.0, 2.0));
+      final image = await boundary.toImage(pixelRatio: pixelRatio.clamp(1.0, 1.6));
       final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
       image.dispose();
       if (byteData == null) return;
