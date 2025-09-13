@@ -297,6 +297,16 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   static const Color? kLogoTintColor = null; // set to a Color to tint logo
   static const String kLogoAsset = 'assets/images/logo.png'; // NEW: logo asset path
 
+  // NEW: amplitude smoothing constants (tweak to change rigidity)
+  static const double kNoiseFloorDb = -38.0; // higher gate -> less sensitivity to low noise
+  static const double kAmpAttack = 0.25;     // slower rise -> feels more rigid
+  static const double kAmpRelease = 0.06;    // slower fall -> avoids jitter
+  static const double kAmpGamma = 2.0;       // stronger curve -> de-emphasize small signals
+  static const int kAmpQuantSteps = 24;      // 0 to disable; higher -> finer steps
+
+  // NEW: smoothed amplitude state
+  double _smoothedAmp = 0.0;
+
   @override
   void initState() {
     super.initState();
@@ -418,6 +428,8 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         _filePath = path;
         _capturedFrames.clear();
         _frameCount = 0;
+        _smoothedAmp = 0.0; // reset smoothing at start
+        _amp.value = 0.0;
       });
 
       // Start amplitude polling
@@ -426,10 +438,23 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         try {
           if (await _mic.isRecording()) {
             final amplitude = await _mic.getAmplitude();
-            final db = amplitude.current; // typically -45..0 dB
-            const minDb = -45.0;
-            final norm = ((db.clamp(minDb, 0.0) - minDb) / -minDb).clamp(0.0, 1.0);
-            _amp.value = norm;
+            final db = amplitude.current;
+            final minDb = kNoiseFloorDb;
+            // Noise gate + normalization 0..1
+            double target = db <= minDb ? 0.0 : ((db - minDb) / (0.0 - minDb)).clamp(0.0, 1.0);
+            // Attack/Release EMA
+            if (target > _smoothedAmp) {
+              _smoothedAmp += kAmpAttack * (target - _smoothedAmp);
+            } else {
+              _smoothedAmp += kAmpRelease * (target - _smoothedAmp);
+            }
+            // Gamma curve to make it more rigid (reduce sensitivity at low levels)
+            double mapped = math.pow(_smoothedAmp.clamp(0.0, 1.0), kAmpGamma).toDouble();
+            // Optional quantization for extra rigidity
+            if (kAmpQuantSteps > 0) {
+              mapped = (mapped * kAmpQuantSteps).round() / kAmpQuantSteps;
+            }
+            _amp.value = mapped.clamp(0.0, 1.0);
           }
         } catch (_) {}
       });
@@ -454,6 +479,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       // Stop capture and amplitude polling
       _stopFrameCapture();
       _ampTimer?.cancel();
+      _smoothedAmp = 0.0; // reset smoothing at stop
       _amp.value = 0;
 
       if (path != null) {
