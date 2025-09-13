@@ -319,14 +319,14 @@ class WaveformPainter extends CustomPainter {
   }
 }
 
-class VoiceRecorderScreen extends StatefulWidget {
-  const VoiceRecorderScreen({super.key});
+class NormalRecorderScreen extends StatefulWidget {
+  const NormalRecorderScreen({super.key});
 
   @override
-  State<VoiceRecorderScreen> createState() => _VoiceRecorderScreenState();
+  State<NormalRecorderScreen> createState() => _NormalRecorderScreenState();
 }
 
-class _VoiceRecorderScreenState extends State<VoiceRecorderScreen> {
+class _NormalRecorderScreenState extends State<NormalRecorderScreen> {
   final GlobalKey _waveformKey = GlobalKey(); // Key to capture waveform widget
   late final RecorderController _recordController;
   late final PlayerController _playerController;
@@ -740,7 +740,7 @@ class _VoiceRecorderScreenState extends State<VoiceRecorderScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Voice Recorder'),
+        title: const Text('Normal Voice Recorder'),
         backgroundColor: Theme
             .of(context)
             .colorScheme
