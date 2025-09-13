@@ -929,19 +929,24 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       // Calculate actual frame rate based on captured frames and audio duration
       await _audioPlayer.setFilePath(_filePath!);
       final durMs = _audioPlayer.duration?.inMilliseconds ?? 0;
-      int calculatedFPS;
-      if (durMs > 0) {
-        calculatedFPS = ((_capturedFrames.length * 1000) / durMs).round();
-      } else {
-        calculatedFPS = 15; // Match our reduced capture rate
+      final audioSeconds = durMs / 1000.0;
+
+      if (audioSeconds <= 0) {
+        throw Exception('Invalid audio duration');
       }
 
-      // Input framerate (as captured), clamp to a sane range
-      final inFps = calculatedFPS.clamp(10, 20); // Lower range for speed
-      const int outFps = 15; // Lower output FPS for speed and size
+      // Calculate the actual frame rate we captured at
+      final actualCaptureRate = _capturedFrames.length / audioSeconds;
+      debugPrint('Audio duration: ${audioSeconds.toStringAsFixed(2)}s');
+      debugPrint('Captured frames: ${_capturedFrames.length}');
+      debugPrint('Actual capture rate: ${actualCaptureRate.toStringAsFixed(2)} fps');
 
-      debugPrint(
-          'Audio duration: ${(durMs / 1000).toStringAsFixed(2)}s, Frames: ${_capturedFrames.length}, In FPS: $inFps, Out FPS: $outFps');
+      // Use a consistent output frame rate
+      const double outputFps = 15.0;
+
+      // Calculate how many frames we need for smooth video
+      final neededFrames = (audioSeconds * outputFps).round();
+      debugPrint('Needed frames for ${outputFps}fps: $neededFrames');
 
       // Prepare frame pattern for FFmpeg
       final framePattern = '$framesDir/frame_%05d.png';
@@ -949,32 +954,47 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       // Rename frames to match the expected pattern
       await _renameFramesSequentially();
 
-      // Much smaller resolution and frame rate; pad to consistent 9:16 canvas
-      final vf = 'fps=$outFps,scale=360:640:force_original_aspect_ratio=decrease,pad=360:640:(ow-iw)/2:(oh-ih)/2:color=0x01004E';
+      // Check actual frames after renaming
+      final renamedFramesDir = Directory(framesDir);
+      final renamedFrames = await renamedFramesDir
+          .list()
+          .where((file) => file.path.contains('frame_') && file.path.endsWith('.png'))
+          .length;
+
+      debugPrint('Frames available after renaming: $renamedFrames');
+
+      // Calculate input frame rate that will make video match audio duration
+      // This ensures the video duration equals audio duration
+      final inputFrameRate = renamedFrames / audioSeconds;
+      final clampedInputRate = inputFrameRate.clamp(10.0, 30.0);
+
+      debugPrint('Calculated input frame rate: ${inputFrameRate.toStringAsFixed(2)} fps');
+      debugPrint('Using clamped input rate: ${clampedInputRate.toStringAsFixed(2)} fps');
+
+      // Video filter with consistent output frame rate
+      final vf = 'fps=$outputFps,scale=360:640:force_original_aspect_ratio=decrease,pad=360:640:(ow-iw)/2:(oh-ih)/2:color=0x01004E';
 
       final command = [
         '-y', // Overwrite output file
-        '-framerate', '$inFps', // Input sequence framerate (as captured)
+        '-framerate', clampedInputRate.toStringAsFixed(2), // Input sequence framerate
         '-i', framePattern, // Input frames pattern
         '-i', _filePath!, // Input audio
-        '-map', '0:v:0', // ensure proper stream mapping
-        '-map', '1:a:0',
-        '-vf', vf, // Small 360x640 canvas
+        '-map', '0:v:0', // Video stream
+        '-map', '1:a:0', // Audio stream
+        '-vf', vf, // Video filters
         '-c:v', 'libx264', // Video codec
         '-preset', 'ultrafast', // Fastest encoding
         '-tune', 'zerolatency', // Optimize for speed
-        '-crf', '36', // Lower quality -> smaller file
+        '-crf', '28', // Better quality than 36
         '-pix_fmt', 'yuv420p', // Compatibility
         '-c:a', 'aac', // Audio codec
         '-ac', '1', // Mono audio
-        '-b:a', '48k', // Low audio bitrate
-        '-shortest', // Match shortest stream duration
+        '-b:a', '64k', // Audio bitrate
+        '-avoid_negative_ts', 'make_zero', // Handle timing issues
+        '-fflags', '+genpts', // Generate presentation timestamps
+        // Remove -shortest to let audio determine duration
         '-movflags', '+faststart', // Web playback
         '-threads', '0', // Use all CPU cores
-        '-g', '30', // Keyframe interval
-        '-sc_threshold', '0', // Disable scene change detection
-        '-maxrate', '900k', // Constrain bitrate for size
-        '-bufsize', '1800k',
         videoPath
       ].join(' ');
 
@@ -1001,14 +1021,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         }
       } else {
         debugPrint('FFmpeg failed with return code: $returnCode');
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Failed to generate waveform video'),
-              backgroundColor: Colors.red,
-            ),
-          );
-        }
+        throw Exception('FFmpeg failed with return code: $returnCode');
       }
     } catch (e) {
       debugPrint('Error generating video: $e');
