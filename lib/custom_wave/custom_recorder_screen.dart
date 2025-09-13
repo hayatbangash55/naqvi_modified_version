@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/foundation.dart'; // for ValueListenable/ValueNotifier and compute()
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
@@ -9,8 +10,10 @@ import 'package:share_plus/share_plus.dart';
 import 'package:audio_waveforms/audio_waveforms.dart';
 import 'package:record/record.dart';
 import 'dart:io';
+import 'dart:typed_data'; // NEW for Uint8List
 import 'dart:ui' as ui;
 import 'dart:math' as math;
+import 'package:flutter/services.dart';
 
 // Custom Waveform Widget
 class CustomWaveformWidget extends StatefulWidget {
@@ -21,6 +24,10 @@ class CustomWaveformWidget extends StatefulWidget {
   final int currentDuration;
   final double width;
   final double height;
+  final String logoAssetPath;
+  final ValueListenable<double> amplitude; // NEW: live amplitude 0..1
+  final Color backgroundColor; // NEW: solid bg color
+  final Color? logoTint; // NEW: optional logo tint
 
   const CustomWaveformWidget({
     super.key,
@@ -31,6 +38,10 @@ class CustomWaveformWidget extends StatefulWidget {
     required this.currentDuration,
     required this.width,
     required this.height,
+    required this.logoAssetPath,
+    required this.amplitude,
+    this.backgroundColor = const Color(0xFF01004E), // NEW default
+    this.logoTint, // NEW
   });
 
   @override
@@ -42,9 +53,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   late AnimationController _animationController;
   final List<double> _amplitudes = [];
   Timer? _amplitudeTimer;
-  double _currentAmplitude = 0.0;
-  final AudioRecorder _amplitudeRecord = AudioRecorder();
-  Timer? _amplitudeMonitorTimer;
+  ui.Image? _logoImage;
 
   @override
   void initState() {
@@ -52,114 +61,55 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
     _animationController = AnimationController(
       duration: const Duration(milliseconds: 100),
       vsync: this,
-    )
-      ..repeat();
-
-    // Initialize with some base amplitudes
+    )..repeat();
     _initializeAmplitudes();
+    _loadLogoImage();
   }
 
   void _initializeAmplitudes() {
-    final patternCount = (widget.width / 20).ceil(); // Each column is ~20px wide now
-    _amplitudes.clear();
-    for (int i = 0; i < patternCount; i++) {
-      _amplitudes.add(0.1); // Start with low amplitude
-    }
-  }
+    final patternCount = (widget.width / 12).ceil();
+    _amplitudes
+      ..clear()
+      ..addAll(List.filled(patternCount, 0.05));
 
-  Future<void> _startAmplitudeMonitoring() async {
-    try {
-      if (await _amplitudeRecord.hasPermission()) {
-        // Start recording to temporary location for amplitude monitoring
-        final tempDir = await getTemporaryDirectory();
-        await _amplitudeRecord.start(
-            const RecordConfig(
-              encoder: AudioEncoder.aacLc,
-              bitRate: 128000,
-              sampleRate: 44100,
-            ),
-            path: '${tempDir.path}/temp_amplitude.m4a'
-        );
-
-        // Monitor amplitude periodically
-        _amplitudeMonitorTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) async {
-          if (await _amplitudeRecord.isRecording()) {
-            final amplitude = await _amplitudeRecord.getAmplitude();
-            // Normalize amplitude - record package typically gives values between -50 to 0 dB
-            // Convert to 0.0 - 1.0 range
-            final normalizedAmplitude = ((amplitude.current + 50) / 50).clamp(0.0, 1.0);
-            if (mounted) {
-              setState(() {
-                _currentAmplitude = normalizedAmplitude;
-              });
-            }
-          }
-        });
-      }
-    } catch (e) {
-      debugPrint('Error starting amplitude monitoring: $e');
-    }
-  }
-
-  Future<void> _stopAmplitudeMonitoring() async {
-    try {
-      _amplitudeMonitorTimer?.cancel();
-      _amplitudeMonitorTimer = null;
-      if (await _amplitudeRecord.isRecording()) {
-        await _amplitudeRecord.stop();
-      }
+    // Timer to shift columns using provided amplitude
+    _amplitudeTimer?.cancel();
+    _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
+      if (!mounted) return;
+      final live = widget.amplitude.value.clamp(0.0, 1.0);
       setState(() {
-        _currentAmplitude = 0.0;
+        if (_amplitudes.isNotEmpty) {
+          _amplitudes.removeAt(0);
+          _amplitudes.add(live);
+        }
       });
+    });
+  }
+
+  void _loadLogoImage() async {
+    try {
+      final data = await rootBundle.load(widget.logoAssetPath);
+      final codec = await ui.instantiateImageCodec(data.buffer.asUint8List());
+      final frame = await codec.getNextFrame();
+      if (!mounted) return;
+      setState(() => _logoImage = frame.image);
     } catch (e) {
-      debugPrint('Error stopping amplitude monitoring: $e');
+      debugPrint('Logo load error: $e');
     }
   }
 
   @override
   void didUpdateWidget(CustomWaveformWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
-
-    if (widget.isRecording && !oldWidget.isRecording) {
-      _startAmplitudeTracking();
-      _startAmplitudeMonitoring();
-    } else if (!widget.isRecording && oldWidget.isRecording) {
-      _stopAmplitudeTracking();
-      _stopAmplitudeMonitoring();
-    }
-
     if (widget.width != oldWidget.width) {
       _initializeAmplitudes();
     }
-  }
-
-  void _startAmplitudeTracking() {
-    _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
-      if (widget.recorderController != null && mounted && widget.isRecording) {
-        setState(() {
-          // Shift amplitudes left and add new one based on real microphone input
-          if (_amplitudes.isNotEmpty) {
-            _amplitudes.removeAt(0);
-            // Use actual amplitude from microphone, with a minimum base level for visibility
-            final amplitudeToAdd = math.max(0.1, _currentAmplitude * 0.8 + 0.2);
-            _amplitudes.add(amplitudeToAdd);
-          }
-        });
-      }
-    });
-  }
-
-  void _stopAmplitudeTracking() {
-    _amplitudeTimer?.cancel();
-    _amplitudeTimer = null;
   }
 
   @override
   void dispose() {
     _animationController.dispose();
     _amplitudeTimer?.cancel();
-    _amplitudeMonitorTimer?.cancel();
-    _amplitudeRecord.dispose();
     super.dispose();
   }
 
@@ -170,7 +120,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
       height: widget.height,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(12.0),
-        color: const Color(0xFF1E1B26),
+        color: widget.backgroundColor, // solid bg
         boxShadow: [
           BoxShadow(
             color: const Color(0x4D000000),
@@ -182,13 +132,17 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
       child: ClipRRect(
         borderRadius: BorderRadius.circular(12.0),
         child: CustomPaint(
-          painter: WaveformPainter(
+          painter: WaveformLogoPainter(
             amplitudes: _amplitudes,
             isRecording: widget.isRecording,
             isPlaying: widget.isPlaying,
             currentDuration: widget.currentDuration,
             maxDuration: widget.playerController?.maxDuration ?? 1000,
-            animation: _animationController,
+            animation: (widget.isRecording || widget.isPlaying)
+                ? _animationController
+                : const AlwaysStoppedAnimation(0.0),
+            logoImage: _logoImage,
+            logoTint: widget.logoTint, // NEW
           ),
           size: Size(widget.width, widget.height),
         ),
@@ -197,125 +151,114 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   }
 }
 
-class WaveformPainter extends CustomPainter {
+// NEW: Painter that draws logo in vertical wave pattern
+class WaveformLogoPainter extends CustomPainter {
   final List<double> amplitudes;
   final bool isRecording;
   final bool isPlaying;
   final int currentDuration;
   final int maxDuration;
   final Animation<double> animation;
+  final ui.Image? logoImage;
+  final Color? logoTint; // NEW
 
-  WaveformPainter({
+  WaveformLogoPainter({
     required this.amplitudes,
     required this.isRecording,
     required this.isPlaying,
     required this.currentDuration,
     required this.maxDuration,
     required this.animation,
+    required this.logoImage,
+    this.logoTint, // NEW
   }) : super(repaint: animation);
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.green
-      ..strokeWidth = 1.5
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
+    // No solid fill here; container already paints bg color
 
-    // Draw background
-    final backgroundPaint = Paint()
-      ..color = const Color(0xFF1E1B26);
-    canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), backgroundPaint);
-
-    // Grid configuration to match screenshot pattern
-    const double crossSize = 8.0; // Size of each cross
-    const double horizontalSpacing = 20.0; // Space between columns
-    const double verticalSpacing = 12.0; // Space between rows
-    final double centerY = size.height / 2;
-
-    // Calculate maximum number of crosses that can fit vertically
-    const int maxVerticalCrosses = 7; // Based on screenshot pattern
-
-    // Calculate number of columns that fit across the width
-    final int columnCount = (size.width / horizontalSpacing).floor();
-
-    for (int col = 0; col < columnCount && col < amplitudes.length; col++) {
-      final amplitude = amplitudes[col];
-      final x = col * horizontalSpacing + horizontalSpacing / 2;
-
-      // Calculate progress for playback indicator
-      double progress = 0.0;
-      if (isPlaying && maxDuration > 0) {
-        progress = currentDuration / maxDuration;
+    // If logo not yet loaded, draw a subtle placeholder so UI isn't empty
+    if (logoImage == null) {
+      final placeholder = Paint()..color = const Color(0x33FFFFFF);
+      final double barW = 4, gap = 6;
+      for (double x = 0; x < size.width; x += (barW + gap)) {
+        final h = (size.height * 0.3) + (size.height * 0.2) * math.sin(x / 20);
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+              Rect.fromCenter(center: Offset(x, size.height / 2), width: barW, height: h),
+              const Radius.circular(2)),
+          placeholder,
+        );
       }
+      return;
+    }
 
-      // Determine if this column should be highlighted
-      final columnProgress = col / columnCount;
-      final isActive = isRecording || (isPlaying && columnProgress <= progress);
+    // Layout configuration: dynamic sizing to fill height and add visible spacing
+    const int maxVerticalLogos = 30; // up to 30 stacked logos
+    const double horizontalGap = 10.0; // visible horizontal spacing
+    const double verticalGap = 6.0; // visible vertical spacing
 
-      // Set color based on state
-      if (isActive) {
-        paint.color = isRecording
-            ? Color.lerp(Colors.green, Colors.lightGreen,
-            0.5 + 0.5 * math.sin(animation.value * 2 * math.pi))!
-            : Colors.green;
-      } else {
-        paint.color = Colors.green.withOpacity(0.3);
-      }
+    // Compute logo size to fit maxVerticalLogos with gaps into available height
+    final double logoHeight = ((size.height - (maxVerticalLogos - 1) * verticalGap) / maxVerticalLogos)
+        .clamp(2.0, size.height);
+    final double logoWidth = logoHeight; // square logos
 
-      // Calculate number of crosses to draw vertically based on amplitude
-      // Amplitude 0.0-1.0 maps to 1-maxVerticalCrosses crosses
-      final int crossCount = math.max(1, (amplitude * maxVerticalCrosses).round());
+    // Compute how many columns fit with spacing across width
+    final double perCol = logoWidth + horizontalGap;
+    final int columnCount = perCol > 0 ? ((size.width + horizontalGap) / perCol).floor() : 0;
+    final double contentWidth = columnCount * logoWidth + (columnCount - 1) * horizontalGap;
+    final double leftPad = ((size.width - contentWidth) / 2).clamp(0.0, size.width);
 
-      // Draw crosses in a vertical column
-      _drawCrossColumn(
-          canvas,
+    final Paint paint = Paint()
+      ..isAntiAlias = true
+      ..filterQuality = FilterQuality.high; // keep original logo colors
+    if (logoTint != null) {
+      paint.colorFilter = ColorFilter.mode(logoTint!, BlendMode.srcATop);
+    }
+
+    for (int col = 0; col < columnCount; col++) {
+      // Read amplitude or fall back to last/zero if not enough samples
+      final double baseAmp = (col < amplitudes.length)
+          ? amplitudes[col]
+          : (amplitudes.isNotEmpty ? amplitudes.last : 0.0);
+      final double amplitude = baseAmp.clamp(0.0, 1.0);
+
+      final double x = leftPad + col * (logoWidth + horizontalGap) + logoWidth / 2;
+
+      // Map amplitude 0..1 to 1..maxVerticalLogos (ceil)
+      final int logoCount = amplitude <= 0
+          ? 1
+          : (amplitude * maxVerticalLogos).ceil().clamp(1, maxVerticalLogos);
+
+      // Compute vertical stack positioning
+      final double totalStackHeight = logoCount * logoHeight + (logoCount - 1) * verticalGap;
+      final double startY = (size.height - totalStackHeight) / 2.0 + logoHeight / 2.0;
+
+      for (int i = 0; i < logoCount; i++) {
+        final double y = startY + i * (logoHeight + verticalGap);
+        final rect = Rect.fromCenter(
+          center: Offset(x, y),
+          width: logoWidth,
+          height: logoHeight,
+        );
+        canvas.drawImageRect(
+          logoImage!,
+          Rect.fromLTWH(0, 0, logoImage!.width.toDouble(), logoImage!.height.toDouble()),
+          rect,
           paint,
-          x,
-          centerY,
-          crossCount,
-          crossSize,
-          verticalSpacing);
+        );
+      }
     }
-  }
-
-  void _drawCrossColumn(Canvas canvas, Paint paint, double centerX, double centerY,
-      int crossCount, double crossSize, double verticalSpacing) {
-    // Calculate starting Y position to center the column
-    final double totalHeight = (crossCount - 1) * verticalSpacing;
-    final double startY = centerY - totalHeight / 2;
-
-    for (int i = 0; i < crossCount; i++) {
-      final double y = startY + i * verticalSpacing;
-      _drawSingleCross(canvas, paint, centerX, y, crossSize);
-    }
-  }
-
-  void _drawSingleCross(Canvas canvas, Paint paint, double centerX, double centerY, double size) {
-    final halfSize = size / 2;
-
-    // Draw vertical line of the cross
-    canvas.drawLine(
-      Offset(centerX, centerY - halfSize),
-      Offset(centerX, centerY + halfSize),
-      paint,
-    );
-
-    // Draw horizontal line of the cross
-    canvas.drawLine(
-      Offset(centerX - halfSize, centerY),
-      Offset(centerX + halfSize, centerY),
-      paint,
-    );
   }
 
   @override
-  bool shouldRepaint(WaveformPainter oldDelegate) {
+  bool shouldRepaint(WaveformLogoPainter oldDelegate) {
     return oldDelegate.amplitudes != amplitudes ||
         oldDelegate.isRecording != isRecording ||
         oldDelegate.isPlaying != isPlaying ||
         oldDelegate.currentDuration != currentDuration ||
-        oldDelegate.maxDuration != maxDuration;
+        oldDelegate.maxDuration != maxDuration ||
+        oldDelegate.logoImage != logoImage;
   }
 }
 
@@ -344,6 +287,15 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   Timer? _frameCaptureTimer;
   static const int _targetFPS = 30; // Target frame rate for video
   int _frameCount = 0;
+  final AudioRecorder _mic = AudioRecorder(); // use concrete AudioRecorder
+  Timer? _ampTimer; // amplitude polling
+  final ValueNotifier<double> _amp = ValueNotifier<double>(0); // 0..1
+  bool _captureBusy = false; // throttle capture
+
+  // NEW: easy-to-edit colors
+  static const Color kWaveBgColor = Color(0xFF01004E);
+  static const Color? kLogoTintColor = null; // set to a Color to tint logo
+  static const String kLogoAsset = 'assets/images/logo.png'; // NEW: logo asset path
 
   @override
   void initState() {
@@ -358,7 +310,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       ..androidEncoder = AndroidEncoder.aac
       ..androidOutputFormat = AndroidOutputFormat.mpeg4
       ..iosEncoder = IosEncoder.kAudioFormatMPEG4AAC
-      ..sampleRate = 44100;
+      ..sampleRate = 48000; // increased quality
   }
 
   void _initPlayer() {
@@ -417,6 +369,8 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
     _playerSubscription?.cancel();
     _durationSubscription?.cancel();
     _scrollController.dispose();
+    _ampTimer?.cancel();
+    _mic.dispose();
     super.dispose();
   }
 
@@ -442,18 +396,23 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   }
 
   Future<void> _startRecording() async {
-    // Stop any ongoing playback
     if (_isPlaying) {
       await _playerController.pausePlayer();
       setState(() => _isPlaying = false);
     }
-
-    // Clear previous frames directory
     await _clearFramesDirectory();
 
     final path = await _getFilePath();
     try {
-      await _recordController.record(path: path);
+      // Start mic recording with high quality
+      await _mic.start(
+        const RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          sampleRate: 48000,
+          bitRate: 128000,
+        ),
+        path: path,
+      );
       setState(() {
         _isRecording = true;
         _filePath = path;
@@ -461,7 +420,21 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         _frameCount = 0;
       });
 
-      // Start capturing waveform frames at consistent intervals
+      // Start amplitude polling
+      _ampTimer?.cancel();
+      _ampTimer = Timer.periodic(const Duration(milliseconds: 50), (_) async {
+        try {
+          if (await _mic.isRecording()) {
+            final amplitude = await _mic.getAmplitude();
+            final db = amplitude.current; // typically -45..0 dB
+            const minDb = -45.0;
+            final norm = ((db.clamp(minDb, 0.0) - minDb) / -minDb).clamp(0.0, 1.0);
+            _amp.value = norm;
+          }
+        } catch (_) {}
+      });
+
+      // Start frame capture at throttled FPS
       _startFrameCapture();
     } catch (e) {
       debugPrint('Error recording: $e');
@@ -469,11 +442,8 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   }
 
   Future<void> _stopRecording() async {
-    // Get the screen width before any async operations
-    final screenWidth = 720; // Fixed even width for consistent video output
-
     try {
-      final path = await _recordController.stop();
+      final path = await _mic.stop();
       setState(() {
         _isRecording = false;
         _filePath = path;
@@ -481,18 +451,18 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         _currentDuration = 0;
       });
 
-      // Stop capturing frames
+      // Stop capture and amplitude polling
       _stopFrameCapture();
+      _ampTimer?.cancel();
+      _amp.value = 0;
 
-      // Reset player and prepare with new recording
       if (path != null) {
         await _playerController.stopPlayer();
         await Future.delayed(const Duration(milliseconds: 200));
-
         if (mounted) {
           await _playerController.preparePlayer(
             path: path,
-            noOfSamples: screenWidth,
+            noOfSamples: 1200,
             shouldExtractWaveform: true,
           );
           _scrollController.jumpTo(0);
@@ -504,8 +474,8 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   }
 
   void _startFrameCapture() {
-    // Capture frames at consistent intervals for smooth video
-    const frameDuration = Duration(milliseconds: 33); // ~30 FPS
+    // Throttle to ~15 FPS to reduce main-thread load
+    const frameDuration = Duration(milliseconds: 66);
     _frameCaptureTimer = Timer.periodic(frameDuration, (timer) {
       _captureWaveformFrame();
     });
@@ -514,6 +484,46 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   void _stopFrameCapture() {
     _frameCaptureTimer?.cancel();
     _frameCaptureTimer = null;
+  }
+
+  Future<void> _captureWaveformFrame() async {
+    if (!_isRecording || _captureBusy) return;
+    _captureBusy = true;
+    try {
+      final boundary = _waveformKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+      if (boundary == null) return;
+      await WidgetsBinding.instance.endOfFrame;
+
+      // Compute pixelRatio to get ~1080x1920 output based on current logical size
+      final logicalSize = (boundary.size);
+      double pixelRatio = 1.0;
+      if (logicalSize.width > 0 && logicalSize.height > 0) {
+        final scaleW = 1080.0 / logicalSize.width;
+        // If aspect ratio is enforced to 9:16, scaleW ~ scaleH; choose scaleW for exact 1080 width
+        pixelRatio = scaleW;
+      }
+
+      final image = await boundary.toImage(pixelRatio: pixelRatio.clamp(1.0, 4.0));
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      image.dispose();
+      if (byteData == null) return;
+
+      final buffer = byteData.buffer.asUint8List();
+      final framesDir = await _getFramesDirectory();
+      final framePath = '$framesDir/frame_${DateTime.now().millisecondsSinceEpoch}_$_frameCount.png';
+
+      // Offload disk write to a background isolate using compute()
+      await compute(_writePngToFile, _FileWritePayload(framePath, buffer));
+
+      setState(() {
+        _capturedFrames.add(framePath);
+        _frameCount++;
+      });
+    } catch (e) {
+      debugPrint('Error capturing waveform frame: $e');
+    } finally {
+      _captureBusy = false;
+    }
   }
 
   Future<void> _clearFramesDirectory() async {
@@ -577,16 +587,19 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
 
       // Calculate actual frame rate based on captured frames and audio duration
       await _audioPlayer.setFilePath(_filePath!);
-      final audioDuration = _audioPlayer.duration;
-      final calculatedFPS = audioDuration != null
-          ? (_capturedFrames.length / audioDuration.inSeconds).round()
-          : _targetFPS;
+      final durMs = _audioPlayer.duration?.inMilliseconds ?? 0;
+      int calculatedFPS;
+      if (durMs > 0) {
+        calculatedFPS = ((_capturedFrames.length * 1000) / durMs).round();
+      } else {
+        calculatedFPS = _targetFPS;
+      }
 
       // Ensure minimum frame rate of 1 and maximum of 60 for practical video generation
       final actualFPS = calculatedFPS.clamp(1, 60);
 
       debugPrint(
-          'Audio duration: ${audioDuration?.inSeconds}s, Frames: ${_capturedFrames.length}, Calculated FPS: $calculatedFPS, Using FPS: $actualFPS');
+          'Audio duration: ${(durMs / 1000).toStringAsFixed(2)}s, Frames: ${_capturedFrames.length}, Calculated FPS: $calculatedFPS, Using FPS: $actualFPS');
 
       // Prepare frame pattern for FFmpeg
       final framePattern = '$framesDir/frame_%05d.png';
@@ -600,7 +613,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         '-r', '$actualFPS', // Use calculated frame rate
         '-i', framePattern, // Input frames pattern
         '-i', _filePath!, // Input audio
-        '-vf', 'scale=720:120:force_original_aspect_ratio=disable', // Ensure even dimensions
+        '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x01004E', // Ensure even dimensions
         '-c:v', 'libx264', // Video codec
         '-preset', 'medium', // Encoding preset
         '-crf', '23', // Quality (lower = better quality)
@@ -706,49 +719,32 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
     );
   }
 
-  Future<void> _captureWaveformFrame() async {
-    if (!_isRecording) return;
-
-    try {
-      final boundary = _waveformKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
-      if (boundary == null) return;
-
-      final image = await boundary.toImage(pixelRatio: 2.0);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-      if (byteData == null) return;
-
-      final buffer = byteData.buffer.asUint8List();
-      final framesDir = await _getFramesDirectory();
-      final framePath = '$framesDir/frame_${DateTime
-          .now()
-          .millisecondsSinceEpoch}_$_frameCount.png';
-      final file = File(framePath);
-      await file.writeAsBytes(buffer);
-
-      setState(() {
-        _capturedFrames.add(framePath);
-        _frameCount++;
-      });
-
-      debugPrint('Captured frame $_frameCount: $framePath');
-    } catch (e) {
-      debugPrint('Error capturing waveform frame: $e');
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Custom Voice Recorder'),
-        backgroundColor: Theme
-            .of(context)
-            .colorScheme
-            .inversePrimary,
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       ),
       body: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
+          // Added: Painted logo preview above the waves container
+          Padding(
+            padding: const EdgeInsets.only(top: 12, left: 16, right: 16, bottom: 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Text(
+                  'Logo preview:',
+                  style: TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+                const SizedBox(width: 8),
+                const LogoPaintPreview(assetPath: kLogoAsset, width: 56, height: 56),
+              ],
+            ),
+          ),
+
           // Recording status
           if (_isRecording)
             Container(
@@ -794,14 +790,36 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
             child: Center(
               child: RepaintBoundary(
                 key: _waveformKey,
-                child: CustomWaveformWidget(
-                  recorderController: _recordController,
-                  playerController: _playerController,
-                  isRecording: _isRecording,
-                  isPlaying: _isPlaying,
-                  currentDuration: _currentDuration,
-                  width: 720, // Fixed even width for consistent video output
-                  height: 120,
+                child: Builder(
+                  builder: (ctx) {
+                    final screen = MediaQuery.of(ctx).size;
+                    // Enforce 9:16 aspect ratio that fits within available area (~90% height)
+                    final maxW = screen.width;
+                    final maxH = screen.height * 0.9;
+                    double targetW = maxW;
+                    double targetH = targetW * 16.0 / 9.0;
+                    if (targetH > maxH) {
+                      targetH = maxH;
+                      targetW = targetH * 9.0 / 16.0;
+                    }
+                    return SizedBox(
+                      width: targetW,
+                      height: targetH,
+                      child: CustomWaveformWidget(
+                        recorderController: null,
+                        playerController: _playerController,
+                        isRecording: _isRecording,
+                        isPlaying: _isPlaying,
+                        currentDuration: _currentDuration,
+                        width: targetW,
+                        height: targetH,
+                        logoAssetPath: kLogoAsset,
+                        amplitude: _amp,
+                        backgroundColor: kWaveBgColor,
+                        logoTint: kLogoTintColor,
+                      ),
+                    );
+                  },
                 ),
               ),
             ),
@@ -877,4 +895,101 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       ),
     );
   }
+}
+
+// NEW: Logo preview widget that paints the logo using Canvas.drawImageRect
+class LogoPaintPreview extends StatefulWidget {
+  final String assetPath;
+  final double width;
+  final double height;
+  const LogoPaintPreview({super.key, required this.assetPath, this.width = 64, this.height = 64});
+
+  @override
+  State<LogoPaintPreview> createState() => _LogoPaintPreviewState();
+}
+
+class _LogoPaintPreviewState extends State<LogoPaintPreview> {
+  ui.Image? _image;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final data = await rootBundle.load(widget.assetPath);
+      final codec = await ui.instantiateImageCodec(data.buffer.asUint8List());
+      final frame = await codec.getNextFrame();
+      if (!mounted) return;
+      setState(() => _image = frame.image);
+    } catch (e) {
+      debugPrint('LogoPaintPreview load failed: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: widget.width,
+      height: widget.height,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: const Color(0xFF121018),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0x33FFFFFF)),
+        ),
+        child: CustomPaint(
+          painter: _LogoPreviewPainter(_image),
+        ),
+      ),
+    );
+  }
+}
+
+class _LogoPreviewPainter extends CustomPainter {
+  final ui.Image? image;
+  _LogoPreviewPainter(this.image);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final bg = Paint()..color = const Color(0xFF121018);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(8)),
+      bg,
+    );
+
+    if (image == null) {
+      final p = Paint()..color = const Color(0x22FFFFFF);
+      final r = Rect.fromCenter(center: Offset(size.width/2, size.height/2), width: size.width*0.6, height: size.height*0.6);
+      canvas.drawRRect(RRect.fromRectAndRadius(r, const Radius.circular(6)), p);
+      return;
+    }
+
+    // Draw the full image fitting inside the box with padding
+    const pad = 6.0;
+    final dst = Rect.fromLTWH(pad, pad, size.width - 2*pad, size.height - 2*pad);
+    final src = Rect.fromLTWH(0, 0, image!.width.toDouble(), image!.height.toDouble());
+
+    // Use a neutral paint (no tint) to show raw painted logo
+    final paint = Paint();
+    canvas.drawImageRect(image!, src, dst, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _LogoPreviewPainter oldDelegate) => oldDelegate.image != image;
+}
+
+// Top-level payload and writer used by compute() to avoid unsendable closures
+class _FileWritePayload {
+  final String path;
+  final Uint8List bytes;
+  const _FileWritePayload(this.path, this.bytes);
+}
+
+Future<bool> _writePngToFile(_FileWritePayload payload) async {
+  final file = File(payload.path);
+  await file.writeAsBytes(payload.bytes, flush: false);
+  return true;
 }
