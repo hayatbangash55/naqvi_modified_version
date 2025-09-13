@@ -29,6 +29,18 @@ class CustomWaveformWidget extends StatefulWidget {
   final Color backgroundColor; // NEW: solid bg color
   final Color? logoTint; // NEW: optional logo tint
 
+  // NEW: controls logo size (lower => bigger logos)
+  final int maxVerticalLogos;
+
+  // NEW: spacing between columns
+  final double horizontalGap;
+
+  // NEW: spacing between stacked logos
+  final double verticalGap;
+
+  // NEW: controls number of columns in amplitude buffer
+  final double amplitudeDensityDivisor;
+
   const CustomWaveformWidget({
     super.key,
     this.recorderController,
@@ -42,6 +54,10 @@ class CustomWaveformWidget extends StatefulWidget {
     required this.amplitude,
     this.backgroundColor = const Color(0xFF01004E), // NEW default
     this.logoTint, // NEW
+    this.maxVerticalLogos = 30, // default previous behavior
+    this.horizontalGap = 10.0,
+    this.verticalGap = 6.0,
+    this.amplitudeDensityDivisor = 12.0,
   });
 
   @override
@@ -67,7 +83,7 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
   }
 
   void _initializeAmplitudes() {
-    final patternCount = (widget.width / 12).ceil();
+    final patternCount = (widget.width / widget.amplitudeDensityDivisor).ceil();
     _amplitudes
       ..clear()
       ..addAll(List.filled(patternCount, 0.05));
@@ -142,7 +158,10 @@ class _CustomWaveformWidgetState extends State<CustomWaveformWidget>
                 ? _animationController
                 : const AlwaysStoppedAnimation(0.0),
             logoImage: _logoImage,
-            logoTint: widget.logoTint, // NEW
+            logoTint: widget.logoTint,
+            maxVerticalLogos: widget.maxVerticalLogos, // NEW
+            horizontalGap: widget.horizontalGap, // NEW
+            verticalGap: widget.verticalGap, // NEW
           ),
           size: Size(widget.width, widget.height),
         ),
@@ -160,7 +179,10 @@ class WaveformLogoPainter extends CustomPainter {
   final int maxDuration;
   final Animation<double> animation;
   final ui.Image? logoImage;
-  final Color? logoTint; // NEW
+  final Color? logoTint;
+  final int maxVerticalLogos; // NEW
+  final double horizontalGap; // NEW
+  final double verticalGap; // NEW
 
   WaveformLogoPainter({
     required this.amplitudes,
@@ -170,7 +192,10 @@ class WaveformLogoPainter extends CustomPainter {
     required this.maxDuration,
     required this.animation,
     required this.logoImage,
-    this.logoTint, // NEW
+    this.logoTint,
+    this.maxVerticalLogos = 30,
+    this.horizontalGap = 10.0,
+    this.verticalGap = 6.0,
   }) : super(repaint: animation);
 
   @override
@@ -193,17 +218,10 @@ class WaveformLogoPainter extends CustomPainter {
       return;
     }
 
-    // Layout configuration: dynamic sizing to fill height and add visible spacing
-    const int maxVerticalLogos = 30; // up to 30 stacked logos
-    const double horizontalGap = 10.0; // visible horizontal spacing
-    const double verticalGap = 6.0; // visible vertical spacing
-
-    // Compute logo size to fit maxVerticalLogos with gaps into available height
+    // Use configurable geometry
     final double logoHeight = ((size.height - (maxVerticalLogos - 1) * verticalGap) / maxVerticalLogos)
         .clamp(2.0, size.height);
-    final double logoWidth = logoHeight; // square logos
-
-    // Compute how many columns fit with spacing across width
+    final double logoWidth = logoHeight;
     final double perCol = logoWidth + horizontalGap;
     final int columnCount = perCol > 0 ? ((size.width + horizontalGap) / perCol).floor() : 0;
     final double contentWidth = columnCount * logoWidth + (columnCount - 1) * horizontalGap;
@@ -211,7 +229,7 @@ class WaveformLogoPainter extends CustomPainter {
 
     final Paint paint = Paint()
       ..isAntiAlias = true
-      ..filterQuality = FilterQuality.high; // keep original logo colors
+      ..filterQuality = FilterQuality.high;
     if (logoTint != null) {
       paint.colorFilter = ColorFilter.mode(logoTint!, BlendMode.srcATop);
     }
@@ -307,6 +325,17 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
   // NEW: smoothed amplitude state
   double _smoothedAmp = 0.0;
 
+  // NEW: spacing/size controls for the wave grid
+  static const int kMaxVerticalLogos = 22; // fewer rows -> larger logo size
+  static const double kHorizontalGap = 16.0; // slightly more distance between waves
+  static const double kVerticalGap = 10.0; // slightly more distance vertically
+  static const double kAmplitudeDensityDivisor = 16.0; // columns count (unchanged)
+
+  // NEW: stopwatch-like timer for recording duration
+  Timer? _recordTimer;
+  DateTime? _recordStart;
+  Duration _recordElapsed = Duration.zero;
+
   @override
   void initState() {
     super.initState();
@@ -381,6 +410,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
     _scrollController.dispose();
     _ampTimer?.cancel();
     _mic.dispose();
+    _recordTimer?.cancel();
     super.dispose();
   }
 
@@ -430,6 +460,18 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
         _frameCount = 0;
         _smoothedAmp = 0.0; // reset smoothing at start
         _amp.value = 0.0;
+        // start stopwatch
+        _recordStart = DateTime.now();
+        _recordElapsed = Duration.zero;
+      });
+
+      _recordTimer?.cancel();
+      _recordTimer = Timer.periodic(const Duration(milliseconds: 200), (_) {
+        if (!_isRecording || _recordStart == null) return;
+        final now = DateTime.now();
+        setState(() {
+          _recordElapsed = now.difference(_recordStart!);
+        });
       });
 
       // Start amplitude polling
@@ -448,9 +490,8 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
             } else {
               _smoothedAmp += kAmpRelease * (target - _smoothedAmp);
             }
-            // Gamma curve to make it more rigid (reduce sensitivity at low levels)
+            // Gamma curve, optional quantization
             double mapped = math.pow(_smoothedAmp.clamp(0.0, 1.0), kAmpGamma).toDouble();
-            // Optional quantization for extra rigidity
             if (kAmpQuantSteps > 0) {
               mapped = (mapped * kAmpQuantSteps).round() / kAmpQuantSteps;
             }
@@ -482,6 +523,11 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       _smoothedAmp = 0.0; // reset smoothing at stop
       _amp.value = 0;
 
+      // stop stopwatch
+      _recordTimer?.cancel();
+      _recordTimer = null;
+      _recordStart = null;
+
       if (path != null) {
         await _playerController.stopPlayer();
         await Future.delayed(const Duration(milliseconds: 200));
@@ -497,6 +543,12 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
     } catch (e) {
       debugPrint('Error stopping recording: $e');
     }
+  }
+
+  String _formatDuration(Duration d) {
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
   void _startFrameCapture() {
@@ -755,22 +807,6 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       body: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          // Added: Painted logo preview above the waves container
-          Padding(
-            padding: const EdgeInsets.only(top: 12, left: 16, right: 16, bottom: 4),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Text(
-                  'Logo preview:',
-                  style: TextStyle(color: Colors.white70, fontSize: 12),
-                ),
-                const SizedBox(width: 8),
-                const LogoPaintPreview(assetPath: kLogoAsset, width: 56, height: 56),
-              ],
-            ),
-          ),
-
           // Recording status
           if (_isRecording)
             Container(
@@ -800,7 +836,15 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
                       fontWeight: FontWeight.bold,
                     ),
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 12),
+                  Text(
+                    _formatDuration(_recordElapsed),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
                   Text(
                     'Frames: ${_capturedFrames.length}',
                     style: const TextStyle(
@@ -812,6 +856,16 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
               ),
             ),
 
+          // Optional timer above even when status hidden (only show while recording)
+          if (_isRecording)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                'Time ${_formatDuration(_recordElapsed)}',
+                style: const TextStyle(color: Colors.white70, fontSize: 14),
+              ),
+            ),
+
           Expanded(
             child: Center(
               child: RepaintBoundary(
@@ -819,7 +873,7 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
                 child: Builder(
                   builder: (ctx) {
                     final screen = MediaQuery.of(ctx).size;
-                    // Enforce 9:16 aspect ratio that fits within available area (~90% height)
+                    // Enforce 9:16 box
                     final maxW = screen.width;
                     final maxH = screen.height * 0.9;
                     double targetW = maxW;
@@ -843,6 +897,10 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
                         amplitude: _amp,
                         backgroundColor: kWaveBgColor,
                         logoTint: kLogoTintColor,
+                        maxVerticalLogos: kMaxVerticalLogos,
+                        horizontalGap: kHorizontalGap,
+                        verticalGap: kVerticalGap,
+                        amplitudeDensityDivisor: kAmplitudeDensityDivisor,
                       ),
                     );
                   },
@@ -921,90 +979,6 @@ class _CustomRecorderScreenState extends State<CustomRecorderScreen> {
       ),
     );
   }
-}
-
-// NEW: Logo preview widget that paints the logo using Canvas.drawImageRect
-class LogoPaintPreview extends StatefulWidget {
-  final String assetPath;
-  final double width;
-  final double height;
-  const LogoPaintPreview({super.key, required this.assetPath, this.width = 64, this.height = 64});
-
-  @override
-  State<LogoPaintPreview> createState() => _LogoPaintPreviewState();
-}
-
-class _LogoPaintPreviewState extends State<LogoPaintPreview> {
-  ui.Image? _image;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    try {
-      final data = await rootBundle.load(widget.assetPath);
-      final codec = await ui.instantiateImageCodec(data.buffer.asUint8List());
-      final frame = await codec.getNextFrame();
-      if (!mounted) return;
-      setState(() => _image = frame.image);
-    } catch (e) {
-      debugPrint('LogoPaintPreview load failed: $e');
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: widget.width,
-      height: widget.height,
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: const Color(0xFF121018),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: const Color(0x33FFFFFF)),
-        ),
-        child: CustomPaint(
-          painter: _LogoPreviewPainter(_image),
-        ),
-      ),
-    );
-  }
-}
-
-class _LogoPreviewPainter extends CustomPainter {
-  final ui.Image? image;
-  _LogoPreviewPainter(this.image);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final bg = Paint()..color = const Color(0xFF121018);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(8)),
-      bg,
-    );
-
-    if (image == null) {
-      final p = Paint()..color = const Color(0x22FFFFFF);
-      final r = Rect.fromCenter(center: Offset(size.width/2, size.height/2), width: size.width*0.6, height: size.height*0.6);
-      canvas.drawRRect(RRect.fromRectAndRadius(r, const Radius.circular(6)), p);
-      return;
-    }
-
-    // Draw the full image fitting inside the box with padding
-    const pad = 6.0;
-    final dst = Rect.fromLTWH(pad, pad, size.width - 2*pad, size.height - 2*pad);
-    final src = Rect.fromLTWH(0, 0, image!.width.toDouble(), image!.height.toDouble());
-
-    // Use a neutral paint (no tint) to show raw painted logo
-    final paint = Paint();
-    canvas.drawImageRect(image!, src, dst, paint);
-  }
-
-  @override
-  bool shouldRepaint(covariant _LogoPreviewPainter oldDelegate) => oldDelegate.image != image;
 }
 
 // Top-level payload and writer used by compute() to avoid unsendable closures
