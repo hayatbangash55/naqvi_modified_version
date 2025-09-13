@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:untitled/custom_wave/custom_recorder_screen.dart';
 import 'package:untitled/custom_wave/recorder_controller.dart';
+import 'package:untitled/custom_wave/vsp_voice_msg_controller.dart';
 
 void main() {
   runApp(const MyApp());
@@ -17,6 +18,7 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple)),
       initialBinding: BindingsBuilder(() {
         Get.put(RecorderGetxController(), permanent: true);
+        // Get.put(VspVoiceMsgController(), permanent: true);
       }),
       home: const CustomRecorderScreen(),
     );
